@@ -1,3 +1,4 @@
 /limewire-purge
+/limewire-purge-linux-amd64
 *.tsv
 *.db
