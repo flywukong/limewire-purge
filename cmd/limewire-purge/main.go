@@ -173,6 +173,9 @@ func runPurge(ctx context.Context, args []string) error {
 		return err
 	}
 	log.Printf("physical bucket: %s (from BucketURL %s, IAMType %s)", store.Bucket, cfg.PieceStore.Store.BucketURL, cfg.PieceStore.Store.IAMType)
+	if err := store.EnsureVersioningDisabled(ctx); err != nil {
+		return err
+	}
 
 	ch, err := chain.New(*chainID, *chainGRPC)
 	if err != nil {
@@ -230,6 +233,9 @@ func runVerify(ctx context.Context, args []string) error {
 	}
 	store, err := s3store.New(ctx, cfg.PieceStore.Store)
 	if err != nil {
+		return err
+	}
+	if err := store.EnsureVersioningDisabled(ctx); err != nil {
 		return err
 	}
 	meta, err := spdb.Open(cfg.SpDB.DSN())

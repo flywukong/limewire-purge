@@ -103,6 +103,24 @@ func (s *Store) Empty(ctx context.Context, prefix string) (bool, error) {
 	return len(objs) == 0, err
 }
 
+// EnsureVersioningDisabled refuses to run against a versioned bucket. With
+// versioning Enabled or Suspended a plain DeleteObjects only writes delete
+// markers: the data still occupies space, yet List/Empty/verify would all see an
+// empty prefix and the tool would wrongly clear metadata and mark the object done.
+// Deleting versioned data needs per-VersionId deletes, which this version does not
+// do — so it stops rather than silently under-deleting. An error querying the
+// status is also treated as "cannot confirm" and refused.
+func (s *Store) EnsureVersioningDisabled(ctx context.Context) error {
+	out, err := s.c.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{Bucket: aws.String(s.Bucket)})
+	if err != nil {
+		return fmt.Errorf("cannot confirm versioning status of bucket %s: %w", s.Bucket, err)
+	}
+	if out.Status != "" { // "Enabled" or "Suspended"
+		return fmt.Errorf("bucket %s has versioning %q; this version only deletes current keys and would leave versioned data behind — aborting", s.Bucket, out.Status)
+	}
+	return nil
+}
+
 // Delete removes one batch (<=1000 keys). It returns what S3 confirmed deleted and
 // what it refused; a non-nil error means the request itself failed.
 func (s *Store) Delete(ctx context.Context, keys []string) (deleted []string, failed []KeyError, err error) {

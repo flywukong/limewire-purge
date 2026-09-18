@@ -72,6 +72,28 @@ IAMType = "SA"
 	}
 }
 
+func TestBucketURLEnvOverride(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "sp.toml")
+	os.WriteFile(p, []byte(`
+[PieceStore.Store]
+Storage = "s3"
+BucketURL = "https://s3.us-east-1.amazonaws.com/stale-toml-bucket"
+IAMType = "SA"
+`), 0o600)
+	// SP overrides BucketURL from BUCKET_URL; the tool must follow, or it would
+	// purge the stale TOML bucket instead of the one the SP actually writes to.
+	t.Setenv("BUCKET_URL", "https://s3.us-east-1.amazonaws.com/real-env-bucket")
+	c, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tgt, err := ParseBucketURL(c.PieceStore.Store.BucketURL)
+	if err != nil || tgt.Bucket != "real-env-bucket" {
+		t.Fatalf("expected real-env-bucket, got %+v %v", tgt, err)
+	}
+}
+
 func TestLoadAcceptsMinio(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "sp.toml")

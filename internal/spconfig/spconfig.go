@@ -45,6 +45,12 @@ func Load(path string) (*Config, error) {
 	}
 	applyEnv(&c.SpDB, "SP_DB_USER", "SP_DB_PASSWORD", "SP_DB_ADDRESS", "SP_DB_DATABASE")
 	applyEnv(&c.BsDB, "BS_DB_USER", "BS_DB_PASSWORD", "BS_DB_ADDRESS", "BS_DB_DATABASE")
+	// The SP overrides the bucket URL from the BUCKET_URL env var
+	// (store/piecestore/piece/piece_store.go overrideConfigFromEnv). Honour it too,
+	// otherwise the tool could target the stale TOML bucket while the SP writes elsewhere.
+	if v, ok := os.LookupEnv("BUCKET_URL"); ok {
+		c.PieceStore.Store.BucketURL = v
+	}
 	if c.PieceStore.Shards > 1 {
 		return nil, fmt.Errorf("PieceStore.Shards=%d: sharded piece stores are not supported by this tool", c.PieceStore.Shards)
 	}
