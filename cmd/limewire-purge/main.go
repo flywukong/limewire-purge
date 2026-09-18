@@ -155,7 +155,8 @@ func runPurge(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("purge", flag.ExitOnError)
 	var c common
 	addCommon(fs, &c)
-	chainREST := fs.String("chain-rest", "https://greenfield-chain.bnbchain.org", "chain REST endpoint")
+	chainGRPC := fs.String("chain-grpc", "greenfield-chain.bnbchain.org:443", "chain gRPC endpoint")
+	chainID := fs.String("chain-id", "greenfield_1017-1", "chain id, e.g. greenfield_1017-1 (mainnet) or greenfield_9000-121 (local)")
 	dryRun := fs.Bool("dry-run", false, "list only; delete nothing; write no progress")
 	conc := fs.Int("concurrency", 8, "objects processed in parallel")
 	qps := fs.Float64("qps", 50, "object-storage requests per second (list + delete)")
@@ -173,7 +174,10 @@ func runPurge(ctx context.Context, args []string) error {
 	}
 	log.Printf("physical bucket: %s (from BucketURL %s, IAMType %s)", store.Bucket, cfg.PieceStore.Store.BucketURL, cfg.PieceStore.Store.IAMType)
 
-	ch := chain.New(*chainREST)
+	ch, err := chain.New(*chainID, *chainGRPC)
+	if err != nil {
+		return err
+	}
 	id, err := ch.HeadBucketID(ctx, c.bucket)
 	if err != nil {
 		return err

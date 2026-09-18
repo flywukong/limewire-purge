@@ -1,103 +1,60 @@
-// Package chain does the two read-only REST lookups the tool needs.
+// Package chain wraps the official greenfield-go-sdk for the two read-only
+// lookups the tool needs, instead of hand-rolling REST calls: the SDK talks the
+// proper chain query protocol and returns typed ObjectInfo / BucketInfo.
 package chain
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"net/http"
-	"strconv"
 	"strings"
-	"time"
+
+	gnfdclient "github.com/bnb-chain/greenfield-go-sdk/client"
 )
 
 type Client struct {
-	base string
-	http *http.Client
+	c gnfdclient.IClient
 }
 
-func New(baseURL string) *Client {
-	return &Client{base: strings.TrimRight(baseURL, "/"), http: &http.Client{Timeout: 30 * time.Second}}
+// New dials the chain gRPC endpoint. chainID is e.g. "greenfield_1017-1" (mainnet)
+// or "greenfield_9000-121" (local). No account is needed for read-only queries.
+func New(chainID, grpcEndpoint string) (*Client, error) {
+	c, err := gnfdclient.New(chainID, grpcEndpoint, gnfdclient.Option{})
+	if err != nil {
+		return nil, fmt.Errorf("dial chain %s @ %s: %w", chainID, grpcEndpoint, err)
+	}
+	return &Client{c: c}, nil
 }
 
 type ObjectHead struct {
 	ID         uint64
 	BucketName string
-	Status     string
+	Status     string // e.g. SEALED / CREATED (OBJECT_STATUS_ prefix stripped)
 	Version    int64
 }
 
 // HeadObjectByID is the pre-delete check: the object must belong to the target bucket.
 func (c *Client) HeadObjectByID(ctx context.Context, oid uint64) (*ObjectHead, error) {
-	var resp struct {
-		ObjectInfo struct {
-			ID         string `json:"id"`
-			BucketName string `json:"bucket_name"`
-			Status     string `json:"object_status"`
-			Version    string `json:"version"`
-		} `json:"object_info"`
-		Code    int    `json:"code"`
-		Message string `json:"message"`
-	}
-	if err := c.get(ctx, fmt.Sprintf("/greenfield/storage/head_object_by_id/%d", oid), &resp); err != nil {
+	d, err := c.c.HeadObjectByID(ctx, fmt.Sprintf("%d", oid))
+	if err != nil {
 		return nil, err
 	}
-	if resp.ObjectInfo.ID == "" {
-		return nil, fmt.Errorf("head_object_by_id %d: %s", oid, firstNonEmpty(resp.Message, "not found"))
+	oi := d.ObjectInfo
+	if oi == nil {
+		return nil, fmt.Errorf("head_object_by_id %d: empty object info", oid)
 	}
-	id, _ := strconv.ParseUint(resp.ObjectInfo.ID, 10, 64)
-	ver, _ := strconv.ParseInt(resp.ObjectInfo.Version, 10, 64)
-	return &ObjectHead{ID: id, BucketName: resp.ObjectInfo.BucketName, Status: resp.ObjectInfo.Status, Version: ver}, nil
+	return &ObjectHead{
+		ID:         oi.Id.Uint64(),
+		BucketName: oi.BucketName,
+		Status:     strings.TrimPrefix(oi.ObjectStatus.String(), "OBJECT_STATUS_"),
+		Version:    oi.Version,
+	}, nil
 }
 
 // HeadBucketID resolves a bucket name to its numeric id (checked once at start-up).
 func (c *Client) HeadBucketID(ctx context.Context, name string) (uint64, error) {
-	var resp struct {
-		BucketInfo struct {
-			ID string `json:"id"`
-		} `json:"bucket_info"`
-		Message string `json:"message"`
-	}
-	if err := c.get(ctx, "/greenfield/storage/head_bucket/"+name, &resp); err != nil {
+	b, err := c.c.HeadBucket(ctx, name)
+	if err != nil {
 		return 0, err
 	}
-	if resp.BucketInfo.ID == "" {
-		return 0, fmt.Errorf("head_bucket %s: %s", name, firstNonEmpty(resp.Message, "not found"))
-	}
-	return strconv.ParseUint(resp.BucketInfo.ID, 10, 64)
-}
-
-func (c *Client) get(ctx context.Context, path string, v any) error {
-	var lastErr error
-	for attempt := 0; attempt < 5; attempt++ {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+path, nil)
-		if err != nil {
-			return err
-		}
-		res, err := c.http.Do(req)
-		if err == nil {
-			err = json.NewDecoder(res.Body).Decode(v)
-			res.Body.Close()
-			if err == nil && res.StatusCode < 500 {
-				return nil
-			}
-			if err == nil {
-				err = fmt.Errorf("http %d", res.StatusCode)
-			}
-		}
-		lastErr = err
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(time.Duration(1<<attempt) * 500 * time.Millisecond):
-		}
-	}
-	return fmt.Errorf("GET %s: %w", path, lastErr)
-}
-
-func firstNonEmpty(a, b string) string {
-	if a != "" {
-		return a
-	}
-	return b
+	return b.Id.Uint64(), nil
 }
