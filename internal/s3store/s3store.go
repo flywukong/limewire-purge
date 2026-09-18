@@ -23,6 +23,16 @@ type Object struct {
 	Size int64
 }
 
+// Version is one entry from a versioned listing: either an object version or a
+// delete marker. VersionID is "null" for data written while versioning was
+// suspended (or before it was ever enabled) — that is a real, deletable id.
+type Version struct {
+	Key            string
+	VersionID      string
+	Size           int64
+	IsDeleteMarker bool
+}
+
 // KeyError is a per-key failure reported inside a DeleteObjects response.
 type KeyError struct {
 	Key, Code, Message string
@@ -103,22 +113,117 @@ func (s *Store) Empty(ctx context.Context, prefix string) (bool, error) {
 	return len(objs) == 0, err
 }
 
-// EnsureVersioningDisabled refuses to run against a versioned bucket. With
-// versioning Enabled or Suspended a plain DeleteObjects only writes delete
-// markers: the data still occupies space, yet List/Empty/verify would all see an
-// empty prefix and the tool would wrongly clear metadata and mark the object done.
-// Deleting versioned data needs per-VersionId deletes, which this version does not
-// do — so it stops rather than silently under-deleting. An error querying the
-// status is also treated as "cannot confirm" and refused.
-func (s *Store) EnsureVersioningDisabled(ctx context.Context) error {
+// VersioningStatus returns "" (never enabled), "Enabled" or "Suspended".
+// An error here is fatal to the caller: with an unknown status we cannot pick a
+// safe deletion mode, since a plain key delete on a versioned bucket only writes
+// a delete marker and leaves the data (and the billed space) behind while every
+// unversioned listing reports the prefix as empty.
+func (s *Store) VersioningStatus(ctx context.Context) (string, error) {
 	out, err := s.c.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{Bucket: aws.String(s.Bucket)})
 	if err != nil {
-		return fmt.Errorf("cannot confirm versioning status of bucket %s: %w", s.Bucket, err)
+		return "", fmt.Errorf("cannot confirm versioning status of bucket %s: %w", s.Bucket, err)
 	}
-	if out.Status != "" { // "Enabled" or "Suspended"
-		return fmt.Errorf("bucket %s has versioning %q; this version only deletes current keys and would leave versioned data behind — aborting", s.Bucket, out.Status)
+	return string(out.Status), nil
+}
+
+// ListVersions returns up to max entries under prefix, always from the start of
+// the prefix, including delete markers. Used instead of List on a versioned
+// bucket: the delete loop relies on a successful version delete making the entry
+// disappear from the next listing.
+func (s *Store) ListVersions(ctx context.Context, prefix string, max int32) ([]Version, error) {
+	out, err := s.c.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+		Bucket: aws.String(s.Bucket), Prefix: aws.String(prefix), MaxKeys: aws.Int32(max),
+	})
+	if err != nil {
+		return nil, err
 	}
-	return nil
+	return toVersions(out.Versions, out.DeleteMarkers), nil
+}
+
+// ListAllVersions pages through every version and delete marker under prefix.
+// Read-only paths (dry-run, verify) use this; the delete loop must not.
+func (s *Store) ListAllVersions(ctx context.Context, prefix string, fn func([]Version) error) error {
+	var keyMarker, versionMarker *string
+	for {
+		out, err := s.c.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+			Bucket: aws.String(s.Bucket), Prefix: aws.String(prefix), MaxKeys: aws.Int32(1000),
+			KeyMarker: keyMarker, VersionIdMarker: versionMarker,
+		})
+		if err != nil {
+			return err
+		}
+		if err := fn(toVersions(out.Versions, out.DeleteMarkers)); err != nil {
+			return err
+		}
+		if out.IsTruncated == nil || !*out.IsTruncated {
+			return nil
+		}
+		keyMarker, versionMarker = out.NextKeyMarker, out.NextVersionIdMarker
+	}
+}
+
+// EmptyVersions reports whether nothing at all is left under prefix — no object
+// version and no delete marker. A prefix holding only delete markers counts as
+// non-empty: the marker is a leftover entry this tool is expected to remove.
+func (s *Store) EmptyVersions(ctx context.Context, prefix string) (bool, error) {
+	vs, err := s.ListVersions(ctx, prefix, 1)
+	return len(vs) == 0, err
+}
+
+// DeleteVersions permanently removes one batch (<=1000 entries) by Key+VersionId.
+// Unlike a plain key delete this frees the bytes on a versioned bucket and adds
+// no new delete marker; passing a delete marker's own id removes the marker.
+func (s *Store) DeleteVersions(ctx context.Context, vs []Version) (deleted []Version, failed []KeyError, err error) {
+	if len(vs) == 0 {
+		return nil, nil, nil
+	}
+	if len(vs) > 1000 {
+		return nil, nil, errors.New("batch larger than 1000 entries")
+	}
+	byKeyVer := make(map[string]Version, len(vs))
+	ids := make([]types.ObjectIdentifier, 0, len(vs))
+	for _, v := range vs {
+		ids = append(ids, types.ObjectIdentifier{Key: aws.String(v.Key), VersionId: aws.String(v.VersionID)})
+		byKeyVer[v.Key+"\x00"+v.VersionID] = v
+	}
+	out, err := s.c.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+		Bucket: aws.String(s.Bucket),
+		Delete: &types.Delete{Objects: ids, Quiet: aws.Bool(false)},
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, d := range out.Deleted {
+		k, ver := aws.ToString(d.Key), aws.ToString(d.VersionId)
+		if v, ok := byKeyVer[k+"\x00"+ver]; ok {
+			deleted = append(deleted, v)
+		} else {
+			deleted = append(deleted, Version{Key: k, VersionID: ver})
+		}
+	}
+	for _, e := range out.Errors {
+		failed = append(failed, KeyError{
+			Key:     aws.ToString(e.Key) + "@" + aws.ToString(e.VersionId),
+			Code:    aws.ToString(e.Code),
+			Message: aws.ToString(e.Message),
+		})
+	}
+	return deleted, failed, nil
+}
+
+func toVersions(vs []types.ObjectVersion, ms []types.DeleteMarkerEntry) []Version {
+	out := make([]Version, 0, len(vs)+len(ms))
+	for _, v := range vs {
+		out = append(out, Version{
+			Key: aws.ToString(v.Key), VersionID: aws.ToString(v.VersionId), Size: aws.ToInt64(v.Size),
+		})
+	}
+	for _, m := range ms {
+		out = append(out, Version{
+			Key: aws.ToString(m.Key), VersionID: aws.ToString(m.VersionId), IsDeleteMarker: true,
+		})
+	}
+	return out
 }
 
 // Delete removes one batch (<=1000 keys). It returns what S3 confirmed deleted and

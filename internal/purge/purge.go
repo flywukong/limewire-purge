@@ -18,12 +18,36 @@ import (
 	"limewire-purge/internal/s3store"
 )
 
-// ObjectStore is the object-storage side: list by prefix, delete a batch.
+// ObjectStore is the object-storage side. The unversioned methods (List/ListAll/
+// Empty/Delete) address objects by key; the versioned ones address them by
+// Key+VersionId and also see delete markers. Which pair is used is decided once,
+// from the bucket's versioning status — see Options.Versioned.
 type ObjectStore interface {
 	List(ctx context.Context, prefix string, max int32) ([]s3store.Object, error)
 	ListAll(ctx context.Context, prefix string, fn func([]s3store.Object) error) error
 	Empty(ctx context.Context, prefix string) (bool, error)
 	Delete(ctx context.Context, keys []string) (deleted []string, failed []s3store.KeyError, err error)
+
+	ListVersions(ctx context.Context, prefix string, max int32) ([]s3store.Version, error)
+	ListAllVersions(ctx context.Context, prefix string, fn func([]s3store.Version) error) error
+	EmptyVersions(ctx context.Context, prefix string) (bool, error)
+	DeleteVersions(ctx context.Context, vs []s3store.Version) (deleted []s3store.Version, failed []s3store.KeyError, err error)
+}
+
+// entry is one deletable thing: a key on an unversioned bucket, or a
+// key+version (possibly a delete marker) on a versioned one.
+type entry struct {
+	key       string
+	versionID string
+	size      int64
+	marker    bool
+}
+
+func (e entry) label() string {
+	if e.versionID == "" {
+		return e.key
+	}
+	return e.key + "@" + e.versionID
 }
 
 // Chain is the pre-delete ownership check.
@@ -51,6 +75,12 @@ type Options struct {
 	MaxRetry    int  // consecutive no-progress rounds (list/delete errors or all-keys-failed) before the object is failed
 	DryRun      bool // list only, never delete, never write progress
 	RetryFailed bool
+	// Versioned selects the version-aware path: list every version and delete
+	// marker under the prefix and delete each by Key+VersionId. Required on a
+	// bucket whose versioning is Enabled or Suspended, where a plain key delete
+	// only adds a delete marker and leaves the bytes (and any historical version)
+	// in place while an unversioned listing reports the prefix as empty.
+	Versioned bool
 }
 
 type Runner struct {
@@ -185,13 +215,20 @@ func (r *Runner) ProcessOne(ctx context.Context, oid uint64) Result {
 		return res
 	}
 
-	// ④ read-only re-check
+	// ④ read-only re-check (on a versioned bucket a leftover delete marker counts
+	// as residue, so this must use the same addressing mode as the deletes)
 	for _, prefix := range pieceop.Prefixes(oid) {
 		if err := r.wait(ctx); err != nil {
 			res.Err = err
 			return res
 		}
-		empty, err := r.Store.Empty(ctx, prefix)
+		var empty bool
+		var err error
+		if r.Opt.Versioned {
+			empty, err = r.Store.EmptyVersions(ctx, prefix)
+		} else {
+			empty, err = r.Store.Empty(ctx, prefix)
+		}
 		if err != nil {
 			res.Err = fmt.Errorf("re-check %s: %w", prefix, err)
 			return res
@@ -223,6 +260,18 @@ func (r *Runner) ProcessOne(ctx context.Context, oid uint64) Result {
 // again next round, so no per-key bookkeeping is needed.
 func (r *Runner) clearPrefix(ctx context.Context, oid uint64, prefix string) (keys, bytes uint64, err error) {
 	if r.Opt.DryRun {
+		if r.Opt.Versioned {
+			err = r.Store.ListAllVersions(ctx, prefix, func(vs []s3store.Version) error {
+				for _, v := range vs {
+					if got, ok := pieceop.ParseOID(v.Key); ok && got == oid {
+						keys++
+						bytes += uint64(v.Size) // delete markers carry no size
+					}
+				}
+				return r.wait(ctx)
+			})
+			return keys, bytes, err
+		}
 		err = r.Store.ListAll(ctx, prefix, func(objs []s3store.Object) error {
 			for _, o := range objs {
 				if got, ok := pieceop.ParseOID(o.Key); ok && got == oid {
@@ -233,6 +282,58 @@ func (r *Runner) clearPrefix(ctx context.Context, oid uint64, prefix string) (ke
 			return r.wait(ctx)
 		})
 		return keys, bytes, err
+	}
+
+	// one listing/deleting pair, chosen by the bucket's versioning mode
+	list := func() ([]entry, error) {
+		objs, lerr := r.Store.List(ctx, prefix, 1000)
+		if lerr != nil {
+			return nil, lerr
+		}
+		out := make([]entry, 0, len(objs))
+		for _, o := range objs {
+			out = append(out, entry{key: o.Key, size: o.Size})
+		}
+		return out, nil
+	}
+	del := func(batch []entry) (deleted []entry, failed []s3store.KeyError, derr error) {
+		ks := make([]string, 0, len(batch))
+		for _, e := range batch {
+			ks = append(ks, e.key)
+		}
+		size := make(map[string]int64, len(batch))
+		for _, e := range batch {
+			size[e.key] = e.size
+		}
+		okKeys, failed, derr := r.Store.Delete(ctx, ks)
+		for _, k := range okKeys {
+			deleted = append(deleted, entry{key: k, size: size[k]})
+		}
+		return deleted, failed, derr
+	}
+	if r.Opt.Versioned {
+		list = func() ([]entry, error) {
+			vs, lerr := r.Store.ListVersions(ctx, prefix, 1000)
+			if lerr != nil {
+				return nil, lerr
+			}
+			out := make([]entry, 0, len(vs))
+			for _, v := range vs {
+				out = append(out, entry{key: v.Key, versionID: v.VersionID, size: v.Size, marker: v.IsDeleteMarker})
+			}
+			return out, nil
+		}
+		del = func(batch []entry) (deleted []entry, failed []s3store.KeyError, derr error) {
+			vs := make([]s3store.Version, 0, len(batch))
+			for _, e := range batch {
+				vs = append(vs, s3store.Version{Key: e.key, VersionID: e.versionID, Size: e.size, IsDeleteMarker: e.marker})
+			}
+			okVs, failed, derr := r.Store.DeleteVersions(ctx, vs)
+			for _, v := range okVs {
+				deleted = append(deleted, entry{key: v.Key, versionID: v.VersionID, size: v.Size, marker: v.IsDeleteMarker})
+			}
+			return deleted, failed, derr
+		}
 	}
 
 	// attempts counts consecutive rounds that made no progress (a failed list, a
@@ -269,7 +370,7 @@ func (r *Runner) clearPrefix(ctx context.Context, oid uint64, prefix string) (ke
 		if err := r.wait(ctx); err != nil {
 			return keys, bytes, err
 		}
-		objs, lerr := r.Store.List(ctx, prefix, 1000)
+		listed, lerr := list()
 		if lerr != nil {
 			attempts++
 			if attempts > r.Opt.MaxRetry {
@@ -281,16 +382,18 @@ func (r *Runner) clearPrefix(ctx context.Context, oid uint64, prefix string) (ke
 			}
 			continue
 		}
-		if len(objs) == 0 {
+		if len(listed) == 0 {
 			return keys, bytes, nil
 		}
-		size := make(map[string]int64, len(objs))
-		all := make([]string, 0, len(objs))
-		for _, o := range objs {
-			all = append(all, o.Key)
-			size[o.Key] = o.Size
+		batch := make([]entry, 0, len(listed)) // fresh slice every round
+		var dropped []string
+		for _, e := range listed {
+			if got, ok := pieceop.ParseOID(e.key); ok && got == oid {
+				batch = append(batch, e)
+			} else {
+				dropped = append(dropped, e.label())
+			}
 		}
-		batch, dropped := pieceop.KeepOnly(all, oid) // fresh slice every round
 		if len(dropped) > 0 {
 			// a correctness violation, not a transient failure — never retry
 			return keys, bytes, fmt.Errorf("listing under %s returned keys of another object (%s); refusing to continue", prefix, strings.Join(dropped[:min(3, len(dropped))], ","))
@@ -298,10 +401,10 @@ func (r *Runner) clearPrefix(ctx context.Context, oid uint64, prefix string) (ke
 		if err := r.wait(ctx); err != nil {
 			return keys, bytes, err
 		}
-		deleted, failed, derr := r.Store.Delete(ctx, batch)
-		for _, k := range deleted {
+		deleted, failed, derr := del(batch)
+		for _, e := range deleted {
 			keys++
-			bytes += uint64(size[k])
+			bytes += uint64(e.size)
 		}
 		if len(deleted) > 0 {
 			attempts = 0 // progress made this round
