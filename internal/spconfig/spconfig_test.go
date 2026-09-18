@@ -72,6 +72,20 @@ IAMType = "SA"
 	}
 }
 
+func TestLoadAcceptsMinio(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "sp.toml")
+	os.WriteFile(p, []byte("[PieceStore.Store]\nStorage = \"minio\"\nBucketURL = \"http://127.0.0.1:9000/sp0\"\nIAMType = \"AKSK\"\n"), 0o600)
+	c, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tgt, err := ParseBucketURL(c.PieceStore.Store.BucketURL)
+	if err != nil || tgt.Bucket != "sp0" || tgt.Endpoint != "http://127.0.0.1:9000" || !tgt.PathStyle {
+		t.Fatalf("minio target: %+v %v", tgt, err)
+	}
+}
+
 func TestLoadRejectsSharded(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "sp.toml")

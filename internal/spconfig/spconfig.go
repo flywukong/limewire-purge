@@ -48,8 +48,10 @@ func Load(path string) (*Config, error) {
 	if c.PieceStore.Shards > 1 {
 		return nil, fmt.Errorf("PieceStore.Shards=%d: sharded piece stores are not supported by this tool", c.PieceStore.Shards)
 	}
-	if c.PieceStore.Store.Storage != "" && c.PieceStore.Store.Storage != "s3" {
-		return nil, fmt.Errorf("PieceStore.Store.Storage=%q: only s3 is supported", c.PieceStore.Store.Storage)
+	switch c.PieceStore.Store.Storage {
+	case "", "s3", "minio": // minio is the SP's name for "S3 API at a custom endpoint"; same wire protocol
+	default:
+		return nil, fmt.Errorf("PieceStore.Store.Storage=%q: only s3 / minio are supported", c.PieceStore.Store.Storage)
 	}
 	return &c, nil
 }
