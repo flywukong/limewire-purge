@@ -15,11 +15,12 @@ import (
 // ---- fakes -------------------------------------------------------------
 
 type fakeStore struct {
-	mu       sync.Mutex
-	objs     map[string]int64
-	failKeys map[string]int // key -> remaining failures to inject
-	maxBatch int            // largest batch seen
-	lists    int
+	mu         sync.Mutex
+	objs       map[string]int64
+	failKeys   map[string]int // key -> remaining failures to inject
+	deleteErrN int            // remaining whole-request delete errors to inject (-1 = forever)
+	maxBatch   int            // largest batch seen
+	lists      int
 }
 
 func newFakeStore(keys ...string) *fakeStore {
@@ -73,6 +74,12 @@ func (f *fakeStore) Empty(ctx context.Context, prefix string) (bool, error) {
 func (f *fakeStore) Delete(_ context.Context, keys []string) ([]string, []s3store.KeyError, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.deleteErrN != 0 { // inject whole-request errors
+		if f.deleteErrN > 0 {
+			f.deleteErrN--
+		}
+		return nil, nil, errors.New("RequestTimeout: injected")
+	}
 	if len(keys) > 1000 {
 		return nil, nil, errors.New("MalformedXML: more than 1000 keys")
 	}
@@ -253,6 +260,34 @@ func TestPersistentFailureGivesUp(t *testing.T) {
 	}
 	if len(st.sorted("s9_")) != 1 {
 		t.Fatal("the failing key must remain for the next attempt")
+	}
+}
+
+// Transient whole-request delete errors are retried (not an immediate fail) and
+// the object still completes once they stop.
+func TestRequestErrorRetriedThenSucceeds(t *testing.T) {
+	st := newFakeStore("s11_s0", "s11_s1")
+	st.deleteErrN = 3 // first 3 delete requests error out, then succeed
+	r := newRunner(st, fakeChain{map[uint64]string{11: "limewire"}}, &fakeMeta{rows: map[uint64]bool{}})
+	r.lim = nil
+	res := r.ProcessOne(context.Background(), 11)
+	if res.Err != nil || res.Keys != 2 || len(st.objs) != 0 {
+		t.Fatalf("res=%+v left=%d", res, len(st.objs))
+	}
+}
+
+// A persistent whole-request delete error gives up after MaxRetry, as FAILED.
+func TestRequestErrorGivesUp(t *testing.T) {
+	st := newFakeStore("s12_s0")
+	st.deleteErrN = -1 // always error
+	r := newRunner(st, fakeChain{map[uint64]string{12: "limewire"}}, &fakeMeta{rows: map[uint64]bool{}})
+	r.lim = nil
+	res := r.ProcessOne(context.Background(), 12)
+	if res.Err == nil || !strings.Contains(res.Err.Error(), "after") {
+		t.Fatalf("expected give-up after retries, got %+v", res)
+	}
+	if len(st.sorted("s12_")) != 1 {
+		t.Fatal("key must remain after give-up")
 	}
 }
 

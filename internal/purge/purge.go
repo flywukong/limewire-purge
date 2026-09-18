@@ -48,7 +48,7 @@ type Options struct {
 	Bucket      string // Greenfield bucket name the object must belong to
 	Concurrency int
 	QPS         float64
-	MaxRetry    int  // rounds with errors and zero progress before the object is failed
+	MaxRetry    int  // consecutive no-progress rounds (list/delete errors or all-keys-failed) before the object is failed
 	DryRun      bool // list only, never delete, never write progress
 	RetryFailed bool
 }
@@ -83,7 +83,7 @@ func (r *Runner) Run(ctx context.Context, total uint64) error {
 		r.Opt.QPS = 50
 	}
 	if r.Opt.MaxRetry <= 0 {
-		r.Opt.MaxRetry = 5
+		r.Opt.MaxRetry = 10
 	}
 	r.total = total
 	r.lim = rate.NewLimiter(rate.Limit(r.Opt.QPS), 1)
@@ -235,14 +235,51 @@ func (r *Runner) clearPrefix(ctx context.Context, oid uint64, prefix string) (ke
 		return keys, bytes, err
 	}
 
-	stuck := 0
+	// attempts counts consecutive rounds that made no progress (a failed list, a
+	// failed delete request, or a delete where every key errored). Any round that
+	// deletes at least one key resets it to 0. Re-listing from the prefix start
+	// means each retry naturally targets only the keys still left, i.e. the
+	// unsuccessful portion. Only after MaxRetry consecutive stuck rounds is the
+	// object given up as failed; the remaining keys stay in the bucket for a
+	// later run. Intermediate failures are logged, not written to the DB.
+	attempts := 0
+	giveUp := func(format string, args ...any) error {
+		return fmt.Errorf(format, args...)
+	}
+	backoff := func() error {
+		if r.lim == nil { // rate limiting disabled (offline tests) — don't sleep
+			return ctx.Err()
+		}
+		shift := attempts
+		if shift > 6 {
+			shift = 6 // cap growth
+		}
+		d := time.Duration(1<<shift) * 500 * time.Millisecond
+		if d > 30*time.Second {
+			d = 30 * time.Second
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(d):
+			return nil
+		}
+	}
 	for {
 		if err := r.wait(ctx); err != nil {
 			return keys, bytes, err
 		}
-		objs, err := r.Store.List(ctx, prefix, 1000)
-		if err != nil {
-			return keys, bytes, fmt.Errorf("list: %w", err)
+		objs, lerr := r.Store.List(ctx, prefix, 1000)
+		if lerr != nil {
+			attempts++
+			if attempts > r.Opt.MaxRetry {
+				return keys, bytes, giveUp("list %s failed after %d retries: %w", prefix, r.Opt.MaxRetry, lerr)
+			}
+			log.Printf("oid=%d %s: list error (retry %d/%d): %v", oid, prefix, attempts, r.Opt.MaxRetry, lerr)
+			if err := backoff(); err != nil {
+				return keys, bytes, err
+			}
+			continue
 		}
 		if len(objs) == 0 {
 			return keys, bytes, nil
@@ -255,35 +292,45 @@ func (r *Runner) clearPrefix(ctx context.Context, oid uint64, prefix string) (ke
 		}
 		batch, dropped := pieceop.KeepOnly(all, oid) // fresh slice every round
 		if len(dropped) > 0 {
+			// a correctness violation, not a transient failure — never retry
 			return keys, bytes, fmt.Errorf("listing under %s returned keys of another object (%s); refusing to continue", prefix, strings.Join(dropped[:min(3, len(dropped))], ","))
 		}
 		if err := r.wait(ctx); err != nil {
 			return keys, bytes, err
 		}
-		deleted, failed, err := r.Store.Delete(ctx, batch)
-		if err != nil {
-			return keys, bytes, fmt.Errorf("delete: %w", err)
-		}
+		deleted, failed, derr := r.Store.Delete(ctx, batch)
 		for _, k := range deleted {
 			keys++
 			bytes += uint64(size[k])
 		}
-		if len(failed) == 0 {
-			stuck = 0
+		if len(deleted) > 0 {
+			attempts = 0 // progress made this round
+		}
+		if derr != nil {
+			if len(deleted) == 0 {
+				attempts++
+			}
+			if attempts > r.Opt.MaxRetry {
+				return keys, bytes, giveUp("delete %s failed after %d retries: %w", prefix, r.Opt.MaxRetry, derr)
+			}
+			log.Printf("oid=%d %s: delete request error (retry %d/%d): %v", oid, prefix, attempts, r.Opt.MaxRetry, derr)
+			if err := backoff(); err != nil {
+				return keys, bytes, err
+			}
 			continue
 		}
+		if len(failed) == 0 {
+			continue // whole batch deleted; re-list for the next page
+		}
 		if len(deleted) == 0 {
-			stuck++
-		} else {
-			stuck = 0
+			attempts++
 		}
-		if stuck >= r.Opt.MaxRetry {
-			return keys, bytes, fmt.Errorf("%d keys keep failing after %d rounds, first: %s", len(failed), stuck, failed[0])
+		if attempts > r.Opt.MaxRetry {
+			return keys, bytes, giveUp("%d keys under %s keep failing after %d retries, first: %s", len(failed), prefix, r.Opt.MaxRetry, failed[0])
 		}
-		select {
-		case <-ctx.Done():
-			return keys, bytes, ctx.Err()
-		case <-time.After(time.Duration(1<<stuck) * 500 * time.Millisecond):
+		log.Printf("oid=%d %s: %d/%d keys failed (retry %d/%d), first: %s", oid, prefix, len(failed), len(batch), attempts, r.Opt.MaxRetry, failed[0])
+		if err := backoff(); err != nil {
+			return keys, bytes, err
 		}
 	}
 }
