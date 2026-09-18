@@ -17,11 +17,9 @@ import (
 type fakeStore struct {
 	mu         sync.Mutex
 	objs       map[string]int64
-	vers       map[string][]fakeVersion // versioned view: key -> versions/markers
-	failKeys   map[string]int           // key (or key@version) -> remaining failures to inject
-	deleteErrN int                      // remaining whole-request delete errors to inject (-1 = forever)
-	listErrN   int                      // remaining list errors to inject (-1 = forever)
-	maxBatch   int                      // largest batch seen
+	failKeys   map[string]int // key -> remaining failures to inject
+	deleteErrN int            // remaining whole-request delete errors to inject (-1 = forever)
+	maxBatch   int            // largest batch seen
 	lists      int
 }
 
@@ -98,104 +96,6 @@ func (f *fakeStore) Delete(_ context.Context, keys []string) ([]string, []s3stor
 		}
 		delete(f.objs, k)
 		deleted = append(deleted, k)
-	}
-	return deleted, failed, nil
-}
-
-// ---- versioned side of the fake: each key holds an ordered list of versions,
-// and a delete marker is just another entry. Mirrors S3 semantics closely enough
-// to exercise the version-aware path: only a delete by Key+VersionId removes an
-// entry, and a prefix still holding a marker is not empty.
-
-type fakeVersion struct {
-	id     string
-	size   int64
-	marker bool
-}
-
-func (f *fakeStore) putVersion(key, id string, size int64, marker bool) {
-	if f.vers == nil {
-		f.vers = map[string][]fakeVersion{}
-	}
-	f.vers[key] = append(f.vers[key], fakeVersion{id: id, size: size, marker: marker})
-}
-
-func (f *fakeStore) sortedVersionKeys(prefix string) []string {
-	var ks []string
-	for k := range f.vers {
-		if strings.HasPrefix(k, prefix) && len(f.vers[k]) > 0 {
-			ks = append(ks, k)
-		}
-	}
-	sort.Strings(ks)
-	return ks
-}
-
-func (f *fakeStore) ListVersions(_ context.Context, prefix string, max int32) ([]s3store.Version, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.listErrN != 0 {
-		if f.listErrN > 0 {
-			f.listErrN--
-		}
-		return nil, errors.New("ListObjectVersions: injected")
-	}
-	var out []s3store.Version
-	for _, k := range f.sortedVersionKeys(prefix) {
-		for _, v := range f.vers[k] {
-			if int32(len(out)) >= max {
-				return out, nil
-			}
-			out = append(out, s3store.Version{Key: k, VersionID: v.id, Size: v.size, IsDeleteMarker: v.marker})
-		}
-	}
-	return out, nil
-}
-
-func (f *fakeStore) ListAllVersions(ctx context.Context, prefix string, fn func([]s3store.Version) error) error {
-	vs, err := f.ListVersions(ctx, prefix, 1<<30)
-	if err != nil {
-		return err
-	}
-	return fn(vs)
-}
-
-func (f *fakeStore) EmptyVersions(ctx context.Context, prefix string) (bool, error) {
-	vs, err := f.ListVersions(ctx, prefix, 1)
-	return len(vs) == 0, err
-}
-
-func (f *fakeStore) DeleteVersions(_ context.Context, vs []s3store.Version) ([]s3store.Version, []s3store.KeyError, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.deleteErrN != 0 {
-		if f.deleteErrN > 0 {
-			f.deleteErrN--
-		}
-		return nil, nil, errors.New("RequestTimeout: injected")
-	}
-	if len(vs) > 1000 {
-		return nil, nil, errors.New("MalformedXML: more than 1000 keys")
-	}
-	if len(vs) > f.maxBatch {
-		f.maxBatch = len(vs)
-	}
-	var deleted []s3store.Version
-	var failed []s3store.KeyError
-	for _, want := range vs {
-		if n := f.failKeys[want.Key+"@"+want.VersionID]; n > 0 {
-			f.failKeys[want.Key+"@"+want.VersionID] = n - 1
-			failed = append(failed, s3store.KeyError{Key: want.Key + "@" + want.VersionID, Code: "InternalError", Message: "injected"})
-			continue
-		}
-		kept := f.vers[want.Key][:0]
-		for _, have := range f.vers[want.Key] {
-			if have.id != want.VersionID {
-				kept = append(kept, have)
-			}
-		}
-		f.vers[want.Key] = kept
-		deleted = append(deleted, want)
 	}
 	return deleted, failed, nil
 }
@@ -412,86 +312,6 @@ func TestResumeAfterInterruption(t *testing.T) {
 	}
 	if meta.rows[5] {
 		t.Fatal("metadata should now be gone")
-	}
-}
-
-// ---- versioned bucket (Suspended or Enabled) ----------------------------
-
-// Everything under the prefix must go: the current null version, any historical
-// version, and any leftover delete marker.
-func TestVersionedDeletesAllVersionsAndMarkers(t *testing.T) {
-	st := newFakeStore()
-	st.putVersion("s20_s0", "null", 100, false) // written while suspended
-	st.putVersion("s20_s1", "v1", 200, false)   // historical version
-	st.putVersion("s20_s1", "v2", 300, false)   // current version
-	st.putVersion("s20_s2", "dm1", 0, true)     // leftover delete marker
-	st.putVersion("e20_s0_p1", "null", 400, false)
-	st.putVersion("s200_s0", "null", 999, false) // neighbour oid — must survive
-	meta := &fakeMeta{rows: map[uint64]bool{20: true}}
-	r := newRunner(st, fakeChain{map[uint64]string{20: "limewire"}}, meta)
-	r.Opt.Versioned = true
-	r.lim = nil
-
-	res := r.ProcessOne(context.Background(), 20)
-	if res.Err != nil {
-		t.Fatalf("unexpected error: %v", res.Err)
-	}
-	if res.Keys != 5 { // 3 versions + 1 marker under s20_, 1 under e20_
-		t.Fatalf("keys=%d want 5", res.Keys)
-	}
-	if res.Bytes != 1000 { // 100+200+300+400, marker contributes 0
-		t.Fatalf("bytes=%d want 1000", res.Bytes)
-	}
-	if len(st.vers["s200_s0"]) != 1 {
-		t.Fatal("neighbour oid must survive")
-	}
-	for _, k := range []string{"s20_s0", "s20_s1", "s20_s2", "e20_s0_p1"} {
-		if len(st.vers[k]) != 0 {
-			t.Fatalf("%s still has %d entries", k, len(st.vers[k]))
-		}
-	}
-	if meta.rows[20] {
-		t.Fatal("metadata should be cleared")
-	}
-}
-
-// A prefix left holding only a delete marker is NOT empty: the re-check must
-// fail rather than declare the object done.
-func TestVersionedMarkerOnlyIsResidue(t *testing.T) {
-	st := newFakeStore()
-	st.putVersion("s21_s0", "null", 10, false)
-	st.putVersion("s21_s1", "dm", 0, true)
-	st.failKeys["s21_s1@dm"] = 1000 // the marker can never be removed
-	meta := &fakeMeta{rows: map[uint64]bool{21: true}}
-	r := newRunner(st, fakeChain{map[uint64]string{21: "limewire"}}, meta)
-	r.Opt.Versioned = true
-	r.lim = nil
-
-	res := r.ProcessOne(context.Background(), 21)
-	if res.Err == nil {
-		t.Fatal("expected failure while a delete marker remains")
-	}
-	if !meta.rows[21] {
-		t.Fatal("metadata must not be cleared when residue remains")
-	}
-}
-
-// Dry-run on a versioned bucket counts versions and markers without deleting.
-func TestVersionedDryRun(t *testing.T) {
-	st := newFakeStore()
-	st.putVersion("s22_s0", "null", 50, false)
-	st.putVersion("s22_s0", "old", 60, false)
-	st.putVersion("s22_s1", "dm", 0, true)
-	r := newRunner(st, fakeChain{map[uint64]string{22: "limewire"}}, &fakeMeta{rows: map[uint64]bool{}})
-	r.Opt.Versioned = true
-	r.Opt.DryRun = true
-	r.lim = nil
-	res := r.ProcessOne(context.Background(), 22)
-	if res.Err != nil || res.Keys != 3 || res.Bytes != 110 {
-		t.Fatalf("res=%+v", res)
-	}
-	if len(st.vers["s22_s0"]) != 2 || len(st.vers["s22_s1"]) != 1 {
-		t.Fatal("dry-run must not delete")
 	}
 }
 

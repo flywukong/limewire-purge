@@ -141,26 +141,6 @@ func runScan(ctx context.Context, args []string) error {
 
 // ---------------------------------------------------------------- purge
 
-// deletionMode picks the addressing mode from the bucket's versioning status.
-// On a bucket whose versioning is Enabled or Suspended a plain key delete only
-// writes a delete marker: the bytes stay billed while an unversioned listing
-// reports the prefix as empty. There we must delete by Key+VersionId instead.
-// An unknown status is fatal — we will not guess and risk under-deleting.
-func deletionMode(ctx context.Context, store *s3store.Store) (versioned bool, err error) {
-	status, err := store.VersioningStatus(ctx)
-	if err != nil {
-		return false, err
-	}
-	switch status {
-	case "":
-		log.Printf("bucket versioning: not enabled — deleting by key")
-		return false, nil
-	default:
-		log.Printf("bucket versioning: %s — deleting by key+versionId (versions and delete markers)", status)
-		return true, nil
-	}
-}
-
 type chainAdapter struct{ c *chain.Client }
 
 func (a chainAdapter) HeadObjectBucket(ctx context.Context, oid uint64) (string, error) {
@@ -193,8 +173,7 @@ func runPurge(ctx context.Context, args []string) error {
 		return err
 	}
 	log.Printf("physical bucket: %s (from BucketURL %s, IAMType %s)", store.Bucket, cfg.PieceStore.Store.BucketURL, cfg.PieceStore.Store.IAMType)
-	versioned, err := deletionMode(ctx, store)
-	if err != nil {
+	if err := store.EnsureVersioningDisabled(ctx); err != nil {
 		return err
 	}
 
@@ -233,7 +212,7 @@ func runPurge(ctx context.Context, args []string) error {
 
 	r := &purge.Runner{
 		Store: store, Chain: chainAdapter{ch}, Meta: meta, Progress: pg,
-		Opt: purge.Options{Bucket: c.bucket, Concurrency: *conc, QPS: *qps, MaxRetry: *maxRetry, DryRun: *dryRun, RetryFailed: *retryFailed, Versioned: versioned},
+		Opt: purge.Options{Bucket: c.bucket, Concurrency: *conc, QPS: *qps, MaxRetry: *maxRetry, DryRun: *dryRun, RetryFailed: *retryFailed},
 	}
 	return r.Run(ctx, cnt.Total)
 }
@@ -256,8 +235,7 @@ func runVerify(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	versioned, err := deletionMode(ctx, store)
-	if err != nil {
+	if err := store.EnsureVersioningDisabled(ctx); err != nil {
 		return err
 	}
 	meta, err := spdb.Open(cfg.SpDB.DSN())
@@ -295,15 +273,8 @@ func runVerify(ctx context.Context, args []string) error {
 			checked++
 			for _, prefix := range pieceop.Prefixes(row.ObjectID) {
 				var n int
-				var lerr error
-				if versioned {
-					// a leftover delete marker is residue too
-					lerr = store.ListAllVersions(ctx, prefix, func(vs []s3store.Version) error { n += len(vs); return lim.Wait(ctx) })
-				} else {
-					lerr = store.ListAll(ctx, prefix, func(objs []s3store.Object) error { n += len(objs); return lim.Wait(ctx) })
-				}
-				if lerr != nil {
-					return fmt.Errorf("oid %d %s: %w", row.ObjectID, prefix, lerr)
+				if err := store.ListAll(ctx, prefix, func(objs []s3store.Object) error { n += len(objs); return lim.Wait(ctx) }); err != nil {
+					return fmt.Errorf("oid %d %s: %w", row.ObjectID, prefix, err)
 				}
 				if n > 0 {
 					residue++
