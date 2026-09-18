@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -103,21 +104,37 @@ func (s *Store) Empty(ctx context.Context, prefix string) (bool, error) {
 	return len(objs) == 0, err
 }
 
-// EnsureVersioningDisabled refuses to run against a versioned bucket. With
-// versioning Enabled or Suspended a plain DeleteObjects only writes delete
-// markers: the data still occupies space, yet List/Empty/verify would all see an
-// empty prefix and the tool would wrongly clear metadata and mark the object done.
-// Deleting versioned data needs per-VersionId deletes, which this version does not
-// do — so it stops rather than silently under-deleting. An error querying the
-// status is also treated as "cannot confirm" and refused.
-func (s *Store) EnsureVersioningDisabled(ctx context.Context) error {
+// EnsureVersioningDisabled refuses to run against a versioned bucket. This tool
+// only ever deletes by key, which on a versioned bucket does not do what we need:
+// with versioning Enabled a plain delete just writes a delete marker and the data
+// survives as a noncurrent version, still billed, while every listing here reports
+// the prefix as empty — the tool would clear metadata and call the object done.
+// With versioning Suspended the current ("null") version IS removed, so space is
+// freed, but any version created while it was Enabled is left behind, and each
+// delete leaves a zero-byte marker this tool cannot see.
+//
+// allowVersioned is the operator's explicit escape hatch (--allow-versioned-bucket)
+// for environments where that is acceptable — e.g. a throwaway test bucket, or a
+// bucket already confirmed to hold no historical versions. It is never safe by
+// default: an unknown versioning status is still fatal, because then we cannot even
+// tell which of the above applies.
+func (s *Store) EnsureVersioningDisabled(ctx context.Context, allowVersioned bool) error {
 	out, err := s.c.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{Bucket: aws.String(s.Bucket)})
 	if err != nil {
 		return fmt.Errorf("cannot confirm versioning status of bucket %s: %w", s.Bucket, err)
 	}
-	if out.Status != "" { // "Enabled" or "Suspended"
-		return fmt.Errorf("bucket %s has versioning %q; this version only deletes current keys and would leave versioned data behind — aborting", s.Bucket, out.Status)
+	if out.Status == "" {
+		return nil
 	}
+	if !allowVersioned {
+		return fmt.Errorf("bucket %s has versioning %q; this tool deletes by key only and would leave versioned data behind. "+
+			"Pass --allow-versioned-bucket to proceed anyway (only for buckets where that is acceptable)", s.Bucket, out.Status)
+	}
+	log.Printf("WARNING: bucket %s has versioning %q and --allow-versioned-bucket was given. "+
+		"Deleting by key only: historical versions (if any) are NOT removed, each delete leaves a "+
+		"zero-byte delete marker, and verify cannot see either — a clean verify does not prove the "+
+		"prefix is truly empty. Do not use this against production without checking for historical versions.",
+		s.Bucket, out.Status)
 	return nil
 }
 

@@ -162,6 +162,7 @@ func runPurge(ctx context.Context, args []string) error {
 	qps := fs.Float64("qps", 50, "object-storage requests per second (list + delete)")
 	maxRetry := fs.Int("max-retry", 10, "consecutive no-progress rounds (list/delete errors or all-keys-failed) before an object is marked failed")
 	retryFailed := fs.Bool("retry-failed", false, "re-process objects previously marked failed")
+	allowVersioned := fs.Bool("allow-versioned-bucket", false, "proceed even if the bucket has versioning Enabled/Suspended; deletes by key only, so historical versions are not removed and delete markers are left behind — test buckets only")
 	fs.Parse(args)
 
 	cfg, err := spconfig.Load(c.config)
@@ -173,7 +174,7 @@ func runPurge(ctx context.Context, args []string) error {
 		return err
 	}
 	log.Printf("physical bucket: %s (from BucketURL %s, IAMType %s)", store.Bucket, cfg.PieceStore.Store.BucketURL, cfg.PieceStore.Store.IAMType)
-	if err := store.EnsureVersioningDisabled(ctx); err != nil {
+	if err := store.EnsureVersioningDisabled(ctx, *allowVersioned); err != nil {
 		return err
 	}
 
@@ -225,6 +226,7 @@ func runVerify(ctx context.Context, args []string) error {
 	addCommon(fs, &c)
 	out := fs.String("out", "./residue.tsv", "residue report (oid<TAB>where<TAB>count)")
 	qps := fs.Float64("qps", 50, "object-storage requests per second")
+	allowVersioned := fs.Bool("allow-versioned-bucket", false, "proceed even if the bucket has versioning Enabled/Suspended; a clean report then does not prove the prefix is truly empty")
 	fs.Parse(args)
 
 	cfg, err := spconfig.Load(c.config)
@@ -235,7 +237,7 @@ func runVerify(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := store.EnsureVersioningDisabled(ctx); err != nil {
+	if err := store.EnsureVersioningDisabled(ctx, *allowVersioned); err != nil {
 		return err
 	}
 	meta, err := spdb.Open(cfg.SpDB.DSN())
