@@ -7,6 +7,44 @@
 不删除链上 object/bucket，不停止计费，也不自动停用 challenge。链上对象可能仍为 SEALED，
 但文件已经无法正常读取。仅用于已确认废弃、已授权清理的 bucket。
 
+## 工作流程
+
+每个 SP 各跑一份，同一份代码只有配置不同。`scan` 从 BSDB 导出名单，`purge` 逐 oid 处理并把结果写进度库，`verify` / `status` 只读复查与汇总。
+
+```mermaid
+flowchart TD
+    subgraph SCAN["scan（每个 SP 一次）"]
+        A["读 BSDB objects_NN<br/>NN = murmur3(bucket) % 64<br/>过滤 bucket_id + name + removed=0"] --> B["写进度库 scan_objects<br/>INSERT IGNORE 名单"]
+    end
+
+    B --> C["purge 领取未处理 oid<br/>scan_objects 左连接 purge_progress<br/>无进度行即待删"]
+
+    subgraph LOOP["purge 单 oid 状态机（并发处理多个 oid）"]
+        direction TB
+        D["① 查链 head object by id"] --> E{"bucket 名与 ID<br/>是否为目标?"}
+        E -->|"否 / 查不到"| X["写 purge_progress status=2<br/>一条都不删"]
+        E -->|"是"| F["② 列举 s&lt;oid&gt;_ 与 e&lt;oid&gt;_<br/>两个前缀都扫，不按角色跳过"]
+        F --> G["③ 校验 key 的 oid<br/>批删每批不超过 1000，按 qps 限速"]
+        G --> H{"从头再列举<br/>是否还有 key?"}
+        H -->|"有"| G
+        H -->|"连续无进展超上限"| X
+        H -->|"两前缀已空"| I["④ 复查两前缀为空"]
+        I -->|"有残留"| X
+        I -->|"空"| J["⑤ 删 integrity_meta_NN 与 piece_hash<br/>按 object_id，删后复查"]
+        J -->|"仍有"| X
+        J -->|"干净"| K["写 purge_progress status=1<br/>累加 deleted_keys 与 bytes"]
+    end
+
+    C --> D
+    K --> C
+    X --> C
+
+    K --> V["verify：忽略进度，重扫全部 oid<br/>两前缀加元数据，输出残留 residue.tsv"]
+    K --> S["status：汇总 done / failed / remaining<br/>与累计 deleted_keys / bytes"]
+```
+
+护栏：`purge` / `verify` 启动先查 `GetBucketVersioning`，版本控制 Enabled/Suspended 或查不到即中止；`PieceStore.Shards > 1` 直接拒绝。中断后原命令重跑即续，失败项用 `--retry-failed` 单独重试。
+
 ## 1. 数据从哪里读，写到哪里
 
 一个 `oid` 对应一个 Greenfield 链上 object，不是一个 S3 key；大对象可能对应数千个 key。
