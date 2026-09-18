@@ -45,6 +45,120 @@ flowchart TD
 
 护栏：`purge` / `verify` 启动先查 `GetBucketVersioning`，版本控制 Enabled/Suspended 或查不到即中止；`PieceStore.Shards > 1` 直接拒绝。中断后原命令重跑即续，失败项用 `--retry-failed` 单独重试。
 
+## 命令详解
+
+四个子命令碰的数据库不同：`scan` 读 BSDB、写进度库；`purge` 读进度库、查链、删 S3、删 SpDB，把结果写回进度库；`verify` 读进度库、只读 S3 和 SpDB；`status` 只读进度库。
+
+| 命令 | BSDB | 链 RPC | S3 物理桶 | SpDB | 进度库 |
+|---|---|---|---|---|---|
+| `scan` | 读 | — | — | — | 写 `scan_objects` |
+| `purge` | — | 读 | 列举 + 删除 | 删除 | 读名单，写 `purge_progress` |
+| `verify` | — | — | 只读列举 | 只读 | 读名单，写 residue 文件 |
+| `status` | — | — | — | — | 只读汇总 |
+
+### `scan` — 从 BSDB 导出名单
+
+把目标 bucket 的全部 objectID 从**本 SP 的 BSDB 索引库**读出来，写进**工具自己的进度库** `scan_objects` 表。只读 BSDB，不删任何数据。
+
+涉及两个库，指定方式不同：
+
+- BSDB（数据源）：不在命令行直接给，从 `--config` 的 TOML `[BsDB]` 段读，可被 `BS_DB_USER/PASSWORD/ADDRESS/DATABASE` 环境变量覆盖。
+- 进度库（写入目标）：用 `--progress-dsn` 直接给完整 MySQL DSN。
+
+执行步骤：
+
+1. 解析 `--config`，按 `objects_NN`（`NN = murmur3(桶名) % 64`）定位 BSDB 中该桶所在的分表。
+2. 先跑一次 `COUNT(*)` 作为连通性与数量心跳（`--count-only` 时到此结束，不写进度库）。
+3. 按源表主键 `id` 游标分批（`--batch`，默认 5000）拉取，筛选 `bucket_id + bucket_name + removed=0`，`INSERT IGNORE` 进 `scan_objects`。
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--config` | 必填 | SP TOML，读 `[BsDB]` |
+| `--progress-dsn` | 必填（`--count-only` 时不需要） | 进度库 DSN |
+| `--bucket` | `limewire` | 逻辑 bucket 名，建议显式指定 |
+| `--bucket-id` | `42268` | 十进制 bucket ID，建议显式指定 |
+| `--batch` | `5000` | 每次查 BSDB 的行数，正整数；不是 S3 删除批大小 |
+| `--count-only` | `false` | 只打印 BSDB 计数，不写库、不建表 |
+
+```bash
+# 只数一下（只连 BSDB）
+./limewire-purge scan --config ~/.local/sp0/config.toml \
+  --bucket purge-test --bucket-id <ID> --count-only
+
+# 导入名单（连 BSDB + 进度库）
+./limewire-purge scan --config ~/.local/sp0/config.toml \
+  --progress-dsn 'root:<pw>@tcp(127.0.0.1:3306)/limewire_purge_sp0' \
+  --bucket purge-test --bucket-id <ID> --batch 5000
+```
+
+`INSERT IGNORE` 使重跑安全：补入新 oid，不覆盖已有行、不清进度。日志里的 `rows written` 是本次提交的行数（含被忽略的重复），不等于新增行数。名单是对象数，不是 S3 key 数——一个对象可能对应多段或多个 EC 分片。
+
+### `purge` — 逐对象删除
+
+从进度库领取还没处理的 oid，逐个删除本 SP 对应的 S3 piece 和 SpDB 元数据，结果写回进度库。这是不可逆物理删除，**没有二次确认，`--dry-run` 默认关闭**。
+
+碰四个地方：进度库（读名单 + 写结果）、链 RPC（每个 oid 删前查归属）、S3 物理桶（列举 + 批删）、SpDB（删元数据）。链和 S3 的指定：
+
+- 链：`--chain-rpc`（带协议的 CometBFT RPC URL，非 gRPC、非 REST）+ `--chain-id`；工具不从 SP TOML 读链配置。
+- S3 桶：从 `--config` 的 `[PieceStore.Store]` 读（`Storage` / `BucketURL` / `IAMType`），`BUCKET_URL` 环境变量优先；云凭证走 `AWS_ACCESS_KEY`/`AWS_SECRET_KEY`（AKSK）或 SDK 默认链（SA/IRSA）。
+
+启动时的硬校验，任一不过直接退出：① 桶未开版本控制；② 链上 bucket ID 与 `--bucket-id` 一致；③ `scan_objects` 非空。
+
+领取规则：普通模式领取「进度库里没有记录」的 oid（未处理或中断未落库）；`--retry-failed` 只领 `status=2` 的失败项。`--concurrency` 个 worker 并发，各处理一个 oid。
+
+单个 oid 的执行顺序：
+
+1. 查链确认对象归属目标 bucket；查不到或不符 → 记失败，一条都不删。
+2. 分别列举 `s<oid>_`、`e<oid>_` 两个前缀，不按 primary/secondary 角色跳过。
+3. 每批 ≤1000 个 key 用 `DeleteObjects` 批删，校验逐 key 结果；每轮从前缀开头重列，删空为止（大对象即「列 1000 → 删 → 再列」的流式循环，不会一次性读全部 key）。
+4. 两个前缀复查为空后，按 `object_id` 删本 SP 的 `integrity_meta_NN` 与 `piece_hash`，再复查无残留。
+5. 写进度：成功 `status=1` 并累加删除量；任一步失败 `status=2` 并记原因，已删部分仍计入。
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--config` | 必填 | SP TOML，读 `[PieceStore.Store]` 与 `[SpDB]` |
+| `--progress-dsn` | 必填 | 进度库 DSN |
+| `--bucket` / `--bucket-id` | `limewire` / `42268` | 目标桶，建议显式指定 |
+| `--chain-rpc` | `https://greenfield-chain.bnbchain.org:443` | CometBFT RPC URL，本地如 `http://127.0.0.1:26657` |
+| `--chain-id` | `greenfield_1017-1` | 与目标链匹配 |
+| `--dry-run` | `false` | 只查链 + 列举命中，不删、不写进度 |
+| `--concurrency` | `8` | 并发处理的 oid 数（不是单批 key 数） |
+| `--qps` | `50` | S3 列举/删除限速；不含链查询和 SDK 内部重试 |
+| `--max-retry` | `5` | 单 oid 逐 key 删除连续无进展的轮数上限 |
+| `--retry-failed` | `false` | 只重试 `status=2` 的对象 |
+
+```bash
+# dry-run：先看命中多少 key，不删
+./limewire-purge purge --config ~/.local/sp0/config.toml \
+  --progress-dsn 'root:<pw>@tcp(127.0.0.1:3306)/limewire_purge_sp0' \
+  --bucket purge-test --bucket-id <ID> \
+  --chain-rpc http://127.0.0.1:26657 --chain-id greenfield_9000-121 \
+  --concurrency 1 --qps 5 --dry-run
+
+# 正式删（去掉 --dry-run）
+./limewire-purge purge --config ~/.local/sp0/config.toml \
+  --progress-dsn 'root:<pw>@tcp(127.0.0.1:3306)/limewire_purge_sp0' \
+  --bucket purge-test --bucket-id <ID> \
+  --chain-rpc http://127.0.0.1:26657 --chain-id greenfield_9000-121 \
+  --concurrency 1 --qps 5
+
+# 只重试之前失败的
+./limewire-purge purge ... --retry-failed
+```
+
+中断后原命令重跑即续：重列前缀以实际剩余为准，不依赖 segment 游标。并发和 QPS 的示例值只是低负载起点，需按本 SP 延迟、错误率和其他租户负载调整。每个 SP 用各自的 `--config` 和独立进度库，不要多个 SP 共用一个进度库。
+
+### `verify` / `status` — 复查与汇总
+
+`verify` 忽略进度状态，对 `scan_objects` 全部 oid 重新只读列举两个前缀并检查 SpDB 元数据，把残留写到 `--out`（默认 `residue.tsv`，格式 `oid<TAB>where<TAB>count`），有残留时返回非零退出码。它不查链、不按 `--bucket` 重新过滤，检查范围由进度库和 SP 配置决定。`status` 只读进度库，打印 `done / failed / remaining` 和累计删除量，`--failures` 控制显示多少条最近失败原因。
+
+```bash
+./limewire-purge verify --config ~/.local/sp0/config.toml \
+  --progress-dsn 'root:<pw>@tcp(127.0.0.1:3306)/limewire_purge_sp0' --qps 5 --out ./residue-sp0.tsv
+
+./limewire-purge status --progress-dsn 'root:<pw>@tcp(127.0.0.1:3306)/limewire_purge_sp0' --failures 50
+```
+
 ## 1. 数据从哪里读，写到哪里
 
 一个 `oid` 对应一个 Greenfield 链上 object，不是一个 S3 key；大对象可能对应数千个 key。
