@@ -1,0 +1,303 @@
+// Package purge is the per-object state machine. Everything it touches sits behind
+// small interfaces so the whole loop can be exercised offline with fakes.
+package purge
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"golang.org/x/time/rate"
+
+	"limewire-purge/internal/pieceop"
+	"limewire-purge/internal/s3store"
+)
+
+// ObjectStore is the object-storage side: list by prefix, delete a batch.
+type ObjectStore interface {
+	List(ctx context.Context, prefix string, max int32) ([]s3store.Object, error)
+	ListAll(ctx context.Context, prefix string, fn func([]s3store.Object) error) error
+	Empty(ctx context.Context, prefix string) (bool, error)
+	Delete(ctx context.Context, keys []string) (deleted []string, failed []s3store.KeyError, err error)
+}
+
+// Chain is the pre-delete ownership check.
+type Chain interface {
+	HeadObjectBucket(ctx context.Context, oid uint64) (bucketName string, err error)
+}
+
+// Meta is the SP's local metadata database.
+type Meta interface {
+	Delete(ctx context.Context, oid uint64) error
+	Exists(ctx context.Context, oid uint64) (bool, error)
+}
+
+// Progress is the tool's own progress table.
+type Progress interface {
+	Claim(ctx context.Context, after uint64, limit int, retryFailed bool) ([]uint64, error)
+	Done(ctx context.Context, oid uint64, keys, bytes uint64) error
+	Fail(ctx context.Context, oid uint64, keys, bytes uint64, reason string) error
+}
+
+type Options struct {
+	Bucket      string // Greenfield bucket name the object must belong to
+	Concurrency int
+	QPS         float64
+	MaxRetry    int  // rounds with errors and zero progress before the object is failed
+	DryRun      bool // list only, never delete, never write progress
+	RetryFailed bool
+}
+
+type Runner struct {
+	Store    ObjectStore
+	Chain    Chain
+	Meta     Meta
+	Progress Progress
+	Opt      Options
+
+	lim       *rate.Limiter
+	processed atomic.Uint64
+	failed    atomic.Uint64
+	keys      atomic.Uint64
+	bytes     atomic.Uint64
+	total     uint64
+}
+
+// Result is what one object attempt produced.
+type Result struct {
+	Keys, Bytes uint64
+	Err         error
+}
+
+// Run drains the progress table with Opt.Concurrency workers.
+func (r *Runner) Run(ctx context.Context, total uint64) error {
+	if r.Opt.Concurrency <= 0 {
+		r.Opt.Concurrency = 1
+	}
+	if r.Opt.QPS <= 0 {
+		r.Opt.QPS = 50
+	}
+	if r.Opt.MaxRetry <= 0 {
+		r.Opt.MaxRetry = 5
+	}
+	r.total = total
+	r.lim = rate.NewLimiter(rate.Limit(r.Opt.QPS), 1)
+
+	ids := make(chan uint64, r.Opt.Concurrency*2)
+	var wg sync.WaitGroup
+	for i := 0; i < r.Opt.Concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for oid := range ids {
+				r.handle(ctx, oid)
+			}
+		}()
+	}
+
+	var after uint64
+	var claimErr error
+feed:
+	for {
+		batch, err := r.Progress.Claim(ctx, after, r.Opt.Concurrency*4, r.Opt.RetryFailed)
+		if err != nil {
+			claimErr = err
+			break
+		}
+		if len(batch) == 0 {
+			break
+		}
+		for _, oid := range batch {
+			select {
+			case ids <- oid:
+			case <-ctx.Done():
+				claimErr = ctx.Err()
+				break feed
+			}
+			after = oid
+		}
+	}
+	close(ids)
+	wg.Wait()
+	log.Printf("finished: processed=%d failed=%d deleted_keys=%d deleted_bytes=%d",
+		r.processed.Load(), r.failed.Load(), r.keys.Load(), r.bytes.Load())
+	return claimErr
+}
+
+func (r *Runner) handle(ctx context.Context, oid uint64) {
+	start := time.Now()
+	res := r.ProcessOne(ctx, oid)
+	n := r.processed.Add(1)
+	r.keys.Add(res.Keys)
+	r.bytes.Add(res.Bytes)
+
+	if r.Opt.DryRun {
+		log.Printf("[dry-run %d/%d] oid=%d keys=%d bytes=%d err=%v", n, r.total, oid, res.Keys, res.Bytes, res.Err)
+		return
+	}
+	if res.Err != nil {
+		r.failed.Add(1)
+		log.Printf("[%d/%d] oid=%d FAILED keys=%d bytes=%d %.1fs: %v", n, r.total, oid, res.Keys, res.Bytes, time.Since(start).Seconds(), res.Err)
+		if err := r.Progress.Fail(ctx, oid, res.Keys, res.Bytes, res.Err.Error()); err != nil {
+			log.Printf("oid=%d: cannot record failure: %v", oid, err)
+		}
+		return
+	}
+	log.Printf("[%d/%d] oid=%d done keys=%d bytes=%d %.1fs", n, r.total, oid, res.Keys, res.Bytes, time.Since(start).Seconds())
+	if err := r.Progress.Done(ctx, oid, res.Keys, res.Bytes); err != nil {
+		log.Printf("oid=%d: cannot record completion: %v", oid, err)
+	}
+}
+
+// ProcessOne runs the full sequence for a single object:
+// chain check → delete both prefixes until empty → re-check empty → clear metadata.
+// Intermediate state lives only in the returned counters.
+func (r *Runner) ProcessOne(ctx context.Context, oid uint64) Result {
+	var res Result
+
+	// ② the object must belong to the target bucket
+	bucket, err := r.Chain.HeadObjectBucket(ctx, oid)
+	if err != nil {
+		res.Err = fmt.Errorf("chain check: %w", err)
+		return res
+	}
+	if bucket != r.Opt.Bucket {
+		res.Err = fmt.Errorf("not in bucket %s (chain says %q); nothing deleted", r.Opt.Bucket, bucket)
+		return res
+	}
+
+	// ③ both prefixes
+	for _, prefix := range pieceop.Prefixes(oid) {
+		k, b, err := r.clearPrefix(ctx, oid, prefix)
+		res.Keys += k
+		res.Bytes += b
+		if err != nil {
+			res.Err = fmt.Errorf("prefix %s: %w", prefix, err)
+			return res
+		}
+	}
+	if r.Opt.DryRun {
+		return res
+	}
+
+	// ④ read-only re-check
+	for _, prefix := range pieceop.Prefixes(oid) {
+		if err := r.wait(ctx); err != nil {
+			res.Err = err
+			return res
+		}
+		empty, err := r.Store.Empty(ctx, prefix)
+		if err != nil {
+			res.Err = fmt.Errorf("re-check %s: %w", prefix, err)
+			return res
+		}
+		if !empty {
+			res.Err = fmt.Errorf("re-check %s: residue", prefix)
+			return res
+		}
+	}
+
+	// ⑤ local metadata
+	if err := r.Meta.Delete(ctx, oid); err != nil {
+		res.Err = fmt.Errorf("metadata delete: %w", err)
+		return res
+	}
+	exists, err := r.Meta.Exists(ctx, oid)
+	if err != nil {
+		res.Err = fmt.Errorf("metadata re-check: %w", err)
+		return res
+	}
+	if exists {
+		res.Err = errors.New("metadata re-check: rows still present")
+	}
+	return res
+}
+
+// clearPrefix lists from the start of prefix and deletes what it sees, until the
+// listing comes back empty. Whatever a failed batch leaves behind is simply listed
+// again next round, so no per-key bookkeeping is needed.
+func (r *Runner) clearPrefix(ctx context.Context, oid uint64, prefix string) (keys, bytes uint64, err error) {
+	if r.Opt.DryRun {
+		err = r.Store.ListAll(ctx, prefix, func(objs []s3store.Object) error {
+			for _, o := range objs {
+				if got, ok := pieceop.ParseOID(o.Key); ok && got == oid {
+					keys++
+					bytes += uint64(o.Size)
+				}
+			}
+			return r.wait(ctx)
+		})
+		return keys, bytes, err
+	}
+
+	stuck := 0
+	for {
+		if err := r.wait(ctx); err != nil {
+			return keys, bytes, err
+		}
+		objs, err := r.Store.List(ctx, prefix, 1000)
+		if err != nil {
+			return keys, bytes, fmt.Errorf("list: %w", err)
+		}
+		if len(objs) == 0 {
+			return keys, bytes, nil
+		}
+		size := make(map[string]int64, len(objs))
+		all := make([]string, 0, len(objs))
+		for _, o := range objs {
+			all = append(all, o.Key)
+			size[o.Key] = o.Size
+		}
+		batch, dropped := pieceop.KeepOnly(all, oid) // fresh slice every round
+		if len(dropped) > 0 {
+			return keys, bytes, fmt.Errorf("listing under %s returned keys of another object (%s); refusing to continue", prefix, strings.Join(dropped[:min(3, len(dropped))], ","))
+		}
+		if err := r.wait(ctx); err != nil {
+			return keys, bytes, err
+		}
+		deleted, failed, err := r.Store.Delete(ctx, batch)
+		if err != nil {
+			return keys, bytes, fmt.Errorf("delete: %w", err)
+		}
+		for _, k := range deleted {
+			keys++
+			bytes += uint64(size[k])
+		}
+		if len(failed) == 0 {
+			stuck = 0
+			continue
+		}
+		if len(deleted) == 0 {
+			stuck++
+		} else {
+			stuck = 0
+		}
+		if stuck >= r.Opt.MaxRetry {
+			return keys, bytes, fmt.Errorf("%d keys keep failing after %d rounds, first: %s", len(failed), stuck, failed[0])
+		}
+		select {
+		case <-ctx.Done():
+			return keys, bytes, ctx.Err()
+		case <-time.After(time.Duration(1<<stuck) * 500 * time.Millisecond):
+		}
+	}
+}
+
+func (r *Runner) wait(ctx context.Context) error {
+	if r.lim == nil {
+		return nil
+	}
+	return r.lim.Wait(ctx)
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
