@@ -1,7 +1,7 @@
 # 在本地 Greenfield 环境测试 limewire-purge
 
 前提：本地集群已起（validators + sp0..sp6 + challenger + MySQL），SP 存储后端为
-MinIO（见下文），链 REST 在 `http://127.0.0.1:1317`。测试桶名假设为 `purge-test`。
+MinIO（见下文），链 CometBFT RPC 在 `http://127.0.0.1:26657`（本地验证器的 RPC 端口，非 REST 的 1317）。测试桶名假设为 `purge-test`。
 
 ## 1. 装工具
 
@@ -14,12 +14,10 @@ make build          # 产出 ./limewire-purge
 make test           # 离线单测：前缀边界 / 2500 key 分批 / 部分失败 / 续跑
 ```
 
-若部署机无 Go，在本机交叉编译后拷过去：
-
-```bash
-make linux          # 产出 limewire-purge-linux-amd64
-scp limewire-purge-linux-amd64 root@devops-bot:/root/
-```
+工具依赖 go-sdk 里的 BLS（C 库），编译需要 CGO/gcc，且工具链固定 Go 1.21.13。
+最简单是直接在部署机上 `make build`。若一定要在别处交叉编译，需装好 linux
+的 C 交叉工具链再 `make linux CC=<cross-gcc>`，产物 `limewire-purge-linux-amd64`
+拷到部署机；纯 `GOOS=linux` 交叉（无 CGO）会链接失败。
 
 ## 2. SP 换成 MinIO 后端（一次性）
 
@@ -86,11 +84,11 @@ CONF=~/.local/sp0/config.toml
 
 # ③ dry-run：只列举不删，看命中 key 数
 ./limewire-purge purge --config $CONF --progress-dsn "$PDSN" \
-    --bucket purge-test --bucket-id <ID> --chain-rest http://127.0.0.1:1317 --dry-run
+    --bucket purge-test --bucket-id <ID> --chain-rpc http://127.0.0.1:26657 --chain-id greenfield_9000-121 --dry-run
 
 # ④ 正式删（sp0）
 ./limewire-purge purge --config $CONF --progress-dsn "$PDSN" \
-    --bucket purge-test --bucket-id <ID> --chain-rest http://127.0.0.1:1317
+    --bucket purge-test --bucket-id <ID> --chain-rpc http://127.0.0.1:26657 --chain-id greenfield_9000-121
 
 # ⑤ 其余 SP：换 --config 指向 spN。进度库用同一个 DSN（scan_objects 共用，
 #    但 purge_progress 会互相覆盖）——多 SP 一起测时，每个 SP 用各自的库/表前缀，

@@ -15,12 +15,20 @@ type Client struct {
 	c gnfdclient.IClient
 }
 
-// New dials the chain gRPC endpoint. chainID is e.g. "greenfield_1017-1" (mainnet)
-// or "greenfield_9000-121" (local). No account is needed for read-only queries.
-func New(chainID, grpcEndpoint string) (*Client, error) {
-	c, err := gnfdclient.New(chainID, grpcEndpoint, gnfdclient.Option{})
+// New connects to the chain's CometBFT RPC endpoint. The go-sdk builds a
+// tendermint/CometBFT HTTP RPC client under the hood, so rpcEndpoint must be a
+// full RPC URL with scheme, e.g. "https://greenfield-chain.bnbchain.org:443"
+// (mainnet) or "http://localhost:26657" (local) — NOT a bare host:port (that
+// parses to an empty host) and NOT the gRPC port. chainID is e.g.
+// "greenfield_1017-1" (mainnet) or "greenfield_9000-121" (local). No account is
+// needed for read-only queries.
+func New(chainID, rpcEndpoint string) (*Client, error) {
+	if !strings.Contains(rpcEndpoint, "://") {
+		rpcEndpoint = "https://" + rpcEndpoint // avoid the silent empty-host misparse
+	}
+	c, err := gnfdclient.New(chainID, rpcEndpoint, gnfdclient.Option{})
 	if err != nil {
-		return nil, fmt.Errorf("dial chain %s @ %s: %w", chainID, grpcEndpoint, err)
+		return nil, fmt.Errorf("dial chain %s @ %s: %w", chainID, rpcEndpoint, err)
 	}
 	return &Client{c: c}, nil
 }

@@ -155,7 +155,7 @@ func runPurge(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("purge", flag.ExitOnError)
 	var c common
 	addCommon(fs, &c)
-	chainGRPC := fs.String("chain-grpc", "greenfield-chain.bnbchain.org:443", "chain gRPC endpoint")
+	chainRPC := fs.String("chain-rpc", "https://greenfield-chain.bnbchain.org:443", "chain CometBFT RPC URL (with scheme); local e.g. http://localhost:26657")
 	chainID := fs.String("chain-id", "greenfield_1017-1", "chain id, e.g. greenfield_1017-1 (mainnet) or greenfield_9000-121 (local)")
 	dryRun := fs.Bool("dry-run", false, "list only; delete nothing; write no progress")
 	conc := fs.Int("concurrency", 8, "objects processed in parallel")
@@ -177,7 +177,7 @@ func runPurge(ctx context.Context, args []string) error {
 		return err
 	}
 
-	ch, err := chain.New(*chainID, *chainGRPC)
+	ch, err := chain.New(*chainID, *chainRPC)
 	if err != nil {
 		return err
 	}

@@ -1,19 +1,25 @@
 BIN := limewire-purge
 
-# The greenfield-go-sdk dependency chain (cometbft -> blst) only compiles under
-# Go 1.21.x, which is also the greenfield stack's standard build toolchain.
+# The greenfield-go-sdk dependency chain (cometbft -> blst / herumi-bls) only
+# compiles under Go 1.21.x, the greenfield stack's standard build toolchain,
+# and it needs CGO (bls/blst are C libraries).
 GOTOOLCHAIN := go1.21.13
 
 .PHONY: build linux test test-logic
 
 build:
-	GOTOOLCHAIN=$(GOTOOLCHAIN) go build -o $(BIN) ./cmd/limewire-purge
+	GOTOOLCHAIN=$(GOTOOLCHAIN) CGO_ENABLED=1 go build -o $(BIN) ./cmd/limewire-purge
 
-# for the devops host (x86_64 Linux); copy the resulting binary with scp
+# Cross-compiling needs CGO, so a plain GOOS=linux build from macOS will NOT
+# link (undefined blst/bls symbols). Two ways to get a linux/amd64 binary:
+#   1. Simplest: clone the repo on the linux/amd64 host and run `make build`.
+#   2. Cross-compile with a C cross-toolchain, e.g. zig:
+#        make linux CC="zig cc -target x86_64-linux-gnu"
+# `go build` reads CC from the environment; set it before running this target.
 linux:
-	GOTOOLCHAIN=$(GOTOOLCHAIN) CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o $(BIN)-linux-amd64 ./cmd/limewire-purge
+	GOTOOLCHAIN=$(GOTOOLCHAIN) CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -trimpath -o $(BIN)-linux-amd64 ./cmd/limewire-purge
 
-# full vet + test; use on the Linux build host (Go 1.21)
+# full vet + test; run on the Linux build host (Go 1.21, CGO available)
 test:
 	GOTOOLCHAIN=$(GOTOOLCHAIN) go vet ./... && GOTOOLCHAIN=$(GOTOOLCHAIN) go test ./...
 
