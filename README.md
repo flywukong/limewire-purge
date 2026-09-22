@@ -114,6 +114,8 @@ flowchart TD
 4. 两个前缀复查为空后，按 `object_id` 删本 SP 的 `integrity_meta_NN` 与 `piece_hash`，再复查无残留。
 5. 写进度：成功 `status=1` 并累加删除量；任一步失败 `status=2` 并记原因，已删部分仍计入。
 
+运行时日志，用于判断是否卡住：领到对象时打 `oid=X start`；每一轮批删后打一行 `oid=X s55_: round N listed=… deleted=… (prefix total keys=… bytes=…)`，大对象会连续出现多轮；每 30 秒一条总进度心跳 `progress: n/total processed, failed=…, keys=…, elapsed=…`；对象完成或失败时打 `[n/total] oid=X done|FAILED …`。
+
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `--config` | 必填 | SP TOML，读 `[PieceStore.Store]` 与 `[SpDB]` |
@@ -478,7 +480,6 @@ Greenfield 的 `_v<n>` key 后缀被同一前缀覆盖，与 S3 云版本控制�
   不能仅凭退出码 0、`finished` 或 `done` 日志验收。
 - 进度库尚无 SP/链/bucket/物理存储身份绑定，也无跨进程任务锁；必须隔离数据库并避免并发运行。
 - verify 仅验证已导入名单；漏扫的 oid 不在检查范围内，空名单也不能证明目标桶已清空。
-- 当前日志主要在 oid 处理结束时输出，没有完整的“当前正在处理 oid / 每个批次”实时进度。
 
 工具复用官方 Greenfield Go SDK 查询链，使用 AWS SDK 执行物理批删；不直接复用 SP 的完整 GC 流程。
 目前有意保留独立实现的两处是：SP `DeleteObjectsByPrefix` 的循环批次累积及错误处理，

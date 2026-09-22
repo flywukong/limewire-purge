@@ -100,6 +100,26 @@ func (r *Runner) Run(ctx context.Context, total uint64) error {
 		}()
 	}
 
+	// heartbeat: overall progress every 30s, so a long-running large object or a
+	// slow bucket never looks like a hang
+	started := time.Now()
+	hbStop := make(chan struct{})
+	go func() {
+		t := time.NewTicker(30 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-hbStop:
+				return
+			case <-t.C:
+				log.Printf("progress: %d/%d processed, %d failed, keys=%d bytes=%d, elapsed=%s",
+					r.processed.Load(), r.total, r.failed.Load(), r.keys.Load(), r.bytes.Load(),
+					time.Since(started).Truncate(time.Second))
+			}
+		}
+	}()
+	defer close(hbStop)
+
 	var after uint64
 	var claimErr error
 feed:
@@ -131,6 +151,7 @@ feed:
 
 func (r *Runner) handle(ctx context.Context, oid uint64) {
 	start := time.Now()
+	log.Printf("oid=%d start", oid)
 	res := r.ProcessOne(ctx, oid)
 	n := r.processed.Add(1)
 	r.keys.Add(res.Keys)
@@ -243,6 +264,7 @@ func (r *Runner) clearPrefix(ctx context.Context, oid uint64, prefix string) (ke
 	// object given up as failed; the remaining keys stay in the bucket for a
 	// later run. Intermediate failures are logged, not written to the DB.
 	attempts := 0
+	round := 0
 	giveUp := func(format string, args ...any) error {
 		return fmt.Errorf(format, args...)
 	}
@@ -266,6 +288,7 @@ func (r *Runner) clearPrefix(ctx context.Context, oid uint64, prefix string) (ke
 		}
 	}
 	for {
+		round++
 		if err := r.wait(ctx); err != nil {
 			return keys, bytes, err
 		}
@@ -306,6 +329,9 @@ func (r *Runner) clearPrefix(ctx context.Context, oid uint64, prefix string) (ke
 		if len(deleted) > 0 {
 			attempts = 0 // progress made this round
 		}
+		// one line per round so a large object visibly advances instead of looking hung
+		log.Printf("oid=%d %s: round %d listed=%d deleted=%d failed=%d (prefix total keys=%d bytes=%d)",
+			oid, prefix, round, len(batch), len(deleted), len(failed), keys, bytes)
 		if derr != nil {
 			if len(deleted) == 0 {
 				attempts++
