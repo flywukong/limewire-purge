@@ -114,6 +114,19 @@ flowchart TD
 4. 两个前缀复查为空后，按 `object_id` 删本 SP 的 `integrity_meta_NN` 与 `piece_hash`，再复查无残留。
 5. 写进度：成功 `status=1` 并累加删除量；任一步失败 `status=2` 并记原因，已删部分仍计入。
 
+**大小对账**：每个 oid 删完（dry-run 时是列举完）后，按哪个前缀有数据推断本 SP 的角色，再和 bsdb 里的链上 `payload_size` 比对：
+
+| 角色 | 判定 | 预期字节 |
+|---|---|---|
+| primary | `s<oid>_` 有数据 | 等于 `payload_size` |
+| secondary | 只有 `e<oid>_` 有数据 | 每段一个分片，累加 ⌈段大小 ÷ 数据分片数⌉，最后一段按余数算 |
+| none | 两个前缀都没数据 | 不比对（未封存对象，或之前已删掉） |
+| mixed | 两个前缀都有数据 | 异常，直接告警 |
+
+secondary 公式可逐字节复现 SP 的实际存储（本地 3+3 实测：5 MiB 对象 1,747,627 B，50 MiB 对象 17,476,269 B）。数据分片数和段大小默认启动时从链上读当前值，也可用 `--data-chunks`、`--segment-size` 指定。
+
+对不上只打 `WARNING` 并记入进度表，**不影响 DONE 判定**：字节已经删掉，拦截也不可逆。`status` 的 `size` 一行给出 checked / ok / mismatch / unchecked，并列出不符的 oid。比对以进度表里的累计 `deleted_bytes` 为准，所以中断重试后的对象也能正确比对；但中断前已删、未落库的字节无从统计，这类对象可能显示为 mismatch。另外链上参数若在对象写入后变过，历史对象也会显示为 mismatch（limewire 存续期间参数未变）。
+
 运行时日志，用于判断是否卡住：领到对象时打 `oid=X start`；每一轮批删后打一行 `oid=X s55_: round N listed=… deleted=… (prefix total keys=… bytes=…)`，大对象会连续出现多轮；每 30 秒一条总进度心跳 `progress: n/total processed, failed=…, keys=…, elapsed=…`；对象完成或失败时打 `[n/total] oid=X done|FAILED …`。
 
 | 参数 | 默认 | 说明 |
@@ -128,6 +141,8 @@ flowchart TD
 | `--qps` | `50` | S3 列举/删除限速；不含链查询和 SDK 内部重试 |
 | `--max-retry` | `10` | 单 oid 连续无进展的退避重试轮数上限（列举错误、删除请求错误、整批 key 全失败都计入；一轮有 key 删成功即清零） |
 | `--retry-failed` | `false` | 只重试 `status=2` 的对象 |
+| `--data-chunks` | `0` | 大小对账用的 EC 数据分片数，0 表示从链上读 |
+| `--segment-size` | `0` | 大小对账用的最大段大小，0 表示从链上读 |
 
 ```bash
 # dry-run：先看命中多少 key，不删

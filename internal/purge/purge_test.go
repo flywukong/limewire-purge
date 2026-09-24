@@ -130,17 +130,19 @@ func (m *fakeMeta) Exists(_ context.Context, oid uint64) (bool, error) {
 type fakeProgress struct {
 	mu      sync.Mutex
 	pending []uint64
+	payload map[uint64]uint64 // oid -> payload_size; missing means 0
 	done    map[uint64][2]uint64
+	checks  map[uint64]SizeCheck
 	failed  map[uint64]string
 }
 
-func (p *fakeProgress) Claim(_ context.Context, after uint64, limit int, retryFailed bool) ([]uint64, error) {
+func (p *fakeProgress) Claim(_ context.Context, after uint64, limit int, retryFailed bool) ([]Claimed, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	var out []uint64
+	var out []Claimed
 	for _, id := range p.pending {
 		if id > after {
-			out = append(out, id)
+			out = append(out, Claimed{OID: id, PayloadSize: p.payload[id]})
 		}
 		if len(out) == limit {
 			break
@@ -148,10 +150,13 @@ func (p *fakeProgress) Claim(_ context.Context, after uint64, limit int, retryFa
 	}
 	return out, nil
 }
-func (p *fakeProgress) Done(_ context.Context, oid, k, b uint64) error {
+func (p *fakeProgress) Done(_ context.Context, oid, k, b uint64, check SizeCheck) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.done[oid] = [2]uint64{k, b}
+	if p.checks != nil {
+		p.checks[oid] = check
+	}
 	return nil
 }
 func (p *fakeProgress) Fail(_ context.Context, oid, k, b uint64, reason string) error {

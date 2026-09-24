@@ -37,10 +37,17 @@ type Meta interface {
 	Exists(ctx context.Context, oid uint64) (bool, error)
 }
 
+// Claimed is one object handed to a worker, with the chain payload size bsdb
+// recorded for it (used only for reconciliation, never to decide deletion).
+type Claimed struct {
+	OID         uint64
+	PayloadSize uint64
+}
+
 // Progress is the tool's own progress table.
 type Progress interface {
-	Claim(ctx context.Context, after uint64, limit int, retryFailed bool) ([]uint64, error)
-	Done(ctx context.Context, oid uint64, keys, bytes uint64) error
+	Claim(ctx context.Context, after uint64, limit int, retryFailed bool) ([]Claimed, error)
+	Done(ctx context.Context, oid uint64, keys, bytes uint64, check SizeCheck) error
 	Fail(ctx context.Context, oid uint64, keys, bytes uint64, reason string) error
 }
 
@@ -51,6 +58,10 @@ type Options struct {
 	MaxRetry    int  // consecutive no-progress rounds (list/delete errors or all-keys-failed) before the object is failed
 	DryRun      bool // list only, never delete, never write progress
 	RetryFailed bool
+	// EC layout used to compute a secondary's expected bytes; 0 disables the
+	// secondary size check (primary is still checked against payload_size)
+	DataChunks  uint32
+	SegmentSize uint64
 }
 
 type Runner struct {
@@ -65,13 +76,16 @@ type Runner struct {
 	failed    atomic.Uint64
 	keys      atomic.Uint64
 	bytes     atomic.Uint64
+	mismatch  atomic.Uint64
 	total     uint64
 }
 
-// Result is what one object attempt produced.
+// Result is what one object attempt produced. SKeys/EKeys split Keys by prefix
+// (s<oid>_ vs e<oid>_) so the SP's role for the object can be inferred.
 type Result struct {
-	Keys, Bytes uint64
-	Err         error
+	Keys, Bytes  uint64
+	SKeys, EKeys uint64
+	Err          error
 }
 
 // Run drains the progress table with Opt.Concurrency workers.
@@ -88,14 +102,14 @@ func (r *Runner) Run(ctx context.Context, total uint64) error {
 	r.total = total
 	r.lim = rate.NewLimiter(rate.Limit(r.Opt.QPS), 1)
 
-	ids := make(chan uint64, r.Opt.Concurrency*2)
+	ids := make(chan Claimed, r.Opt.Concurrency*2)
 	var wg sync.WaitGroup
 	for i := 0; i < r.Opt.Concurrency; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for oid := range ids {
-				r.handle(ctx, oid)
+			for c := range ids {
+				r.handle(ctx, c)
 			}
 		}()
 	}
@@ -132,33 +146,36 @@ feed:
 		if len(batch) == 0 {
 			break
 		}
-		for _, oid := range batch {
+		for _, c := range batch {
 			select {
-			case ids <- oid:
+			case ids <- c:
 			case <-ctx.Done():
 				claimErr = ctx.Err()
 				break feed
 			}
-			after = oid
+			after = c.OID
 		}
 	}
 	close(ids)
 	wg.Wait()
-	log.Printf("finished: processed=%d failed=%d deleted_keys=%d deleted_bytes=%d",
-		r.processed.Load(), r.failed.Load(), r.keys.Load(), r.bytes.Load())
+	log.Printf("finished: processed=%d failed=%d deleted_keys=%d deleted_bytes=%d size_mismatch=%d",
+		r.processed.Load(), r.failed.Load(), r.keys.Load(), r.bytes.Load(), r.mismatch.Load())
 	return claimErr
 }
 
-func (r *Runner) handle(ctx context.Context, oid uint64) {
+func (r *Runner) handle(ctx context.Context, c Claimed) {
+	oid := c.OID
 	start := time.Now()
 	log.Printf("oid=%d start", oid)
 	res := r.ProcessOne(ctx, oid)
 	n := r.processed.Add(1)
 	r.keys.Add(res.Keys)
 	r.bytes.Add(res.Bytes)
+	check := r.checkSize(res, c.PayloadSize)
+	verdict := r.verdict(oid, res, check, c.PayloadSize)
 
 	if r.Opt.DryRun {
-		log.Printf("[dry-run %d/%d] oid=%d keys=%d bytes=%d err=%v", n, r.total, oid, res.Keys, res.Bytes, res.Err)
+		log.Printf("[dry-run %d/%d] oid=%d keys=%d bytes=%d %s size=%s err=%v", n, r.total, oid, res.Keys, res.Bytes, check, verdict, res.Err)
 		return
 	}
 	if res.Err != nil {
@@ -169,9 +186,36 @@ func (r *Runner) handle(ctx context.Context, oid uint64) {
 		}
 		return
 	}
-	log.Printf("[%d/%d] oid=%d done keys=%d bytes=%d %.1fs", n, r.total, oid, res.Keys, res.Bytes, time.Since(start).Seconds())
-	if err := r.Progress.Done(ctx, oid, res.Keys, res.Bytes); err != nil {
+	log.Printf("[%d/%d] oid=%d done keys=%d bytes=%d %s size=%s %.1fs", n, r.total, oid, res.Keys, res.Bytes, check, verdict, time.Since(start).Seconds())
+	if err := r.Progress.Done(ctx, oid, res.Keys, res.Bytes, check); err != nil {
 		log.Printf("oid=%d: cannot record completion: %v", oid, err)
+	}
+}
+
+// verdict compares this attempt's bytes with the expectation and logs a warning
+// on mismatch. A mismatch on a resumed object can be a false alarm: bytes removed
+// by an earlier interrupted run were never recorded, so this attempt sees less.
+func (r *Runner) verdict(oid uint64, res Result, check SizeCheck, payload uint64) string {
+	switch {
+	case res.Err != nil:
+		return "n/a"
+	case check.Role == "mixed":
+		r.mismatch.Add(1)
+		log.Printf("WARNING oid=%d: data under both s%d_ and e%d_ on this SP (primary and secondary at once) — unexpected, inspect manually", oid, oid, oid)
+		return "ANOMALY"
+	case !check.Known:
+		return "skip"
+	case r.Opt.RetryFailed:
+		// this attempt only removes what an earlier attempt left; the cumulative
+		// comparison in `status` is the authoritative one
+		return "see-status"
+	case res.Bytes == check.Expected:
+		return "ok"
+	default:
+		r.mismatch.Add(1)
+		log.Printf("WARNING oid=%d: size mismatch, %s holds %d bytes but chain payload %d implies %d (earlier interrupted run, wrong bucket/config, or corrupt data)",
+			oid, check.Role, res.Bytes, payload, check.Expected)
+		return "MISMATCH"
 	}
 }
 
@@ -192,11 +236,16 @@ func (r *Runner) ProcessOne(ctx context.Context, oid uint64) Result {
 		return res
 	}
 
-	// ③ both prefixes
-	for _, prefix := range pieceop.Prefixes(oid) {
+	// ③ both prefixes (index 0 is s<oid>_, 1 is e<oid>_)
+	for i, prefix := range pieceop.Prefixes(oid) {
 		k, b, err := r.clearPrefix(ctx, oid, prefix)
 		res.Keys += k
 		res.Bytes += b
+		if i == 0 {
+			res.SKeys += k
+		} else {
+			res.EKeys += k
+		}
 		if err != nil {
 			res.Err = fmt.Errorf("prefix %s: %w", prefix, err)
 			return res

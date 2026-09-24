@@ -58,6 +58,20 @@ func (c *Client) HeadObjectByID(ctx context.Context, oid uint64) (*ObjectHead, e
 	}, nil
 }
 
+// RedundancyParams returns the chain's current EC data-chunk count and max segment
+// size. GetRedundancyParams is not on the SDK's public interface but is a method
+// of the concrete client New returns.
+func (c *Client) RedundancyParams() (dataChunks uint32, segmentSize uint64, err error) {
+	rp, ok := c.c.(interface {
+		GetRedundancyParams() (uint32, uint32, uint64, error)
+	})
+	if !ok {
+		return 0, 0, fmt.Errorf("sdk client does not expose GetRedundancyParams")
+	}
+	data, _, seg, err := rp.GetRedundancyParams()
+	return data, seg, err
+}
+
 // HeadBucketID resolves a bucket name to its numeric id (checked once at start-up).
 func (c *Client) HeadBucketID(ctx context.Context, name string) (uint64, error) {
 	b, err := c.c.HeadBucket(ctx, name)

@@ -151,6 +151,34 @@ func (a chainAdapter) HeadObjectBucket(ctx context.Context, oid uint64) (string,
 	return h.BucketName, nil
 }
 
+// progressAdapter maps the purge package's Progress interface onto the progress DB.
+type progressAdapter struct{ db *progress.DB }
+
+func (a progressAdapter) Claim(ctx context.Context, after uint64, limit int, retryFailed bool) ([]purge.Claimed, error) {
+	rows, err := a.db.Claim(ctx, after, limit, retryFailed)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]purge.Claimed, len(rows))
+	for i, r := range rows {
+		out[i] = purge.Claimed{OID: r.ObjectID, PayloadSize: r.PayloadSize}
+	}
+	return out, nil
+}
+
+func (a progressAdapter) Done(ctx context.Context, oid uint64, keys, bytes uint64, check purge.SizeCheck) error {
+	var expected *uint64
+	if check.Known {
+		e := check.Expected
+		expected = &e
+	}
+	return a.db.Done(ctx, oid, keys, bytes, check.Role, expected)
+}
+
+func (a progressAdapter) Fail(ctx context.Context, oid uint64, keys, bytes uint64, reason string) error {
+	return a.db.Fail(ctx, oid, keys, bytes, reason)
+}
+
 func runPurge(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("purge", flag.ExitOnError)
 	var c common
@@ -163,6 +191,8 @@ func runPurge(ctx context.Context, args []string) error {
 	maxRetry := fs.Int("max-retry", 10, "consecutive no-progress rounds (list/delete errors or all-keys-failed) before an object is marked failed")
 	retryFailed := fs.Bool("retry-failed", false, "re-process objects previously marked failed")
 	allowVersioned := fs.Bool("allow-versioned-bucket", false, "proceed even if the bucket has versioning Enabled/Suspended; deletes by key only, so historical versions are not removed and delete markers are left behind — test buckets only")
+	dataChunks := fs.Uint("data-chunks", 0, "EC data chunks for the secondary size check; 0 = read current value from chain")
+	segmentSize := fs.Uint64("segment-size", 0, "max segment size for the secondary size check; 0 = read current value from chain")
 	fs.Parse(args)
 
 	cfg, err := spconfig.Load(c.config)
@@ -190,6 +220,24 @@ func runPurge(ctx context.Context, args []string) error {
 		return fmt.Errorf("chain says bucket %s has id %d, flag --bucket-id is %d; refusing to run", c.bucket, id, c.bucketID)
 	}
 
+	// EC layout for the size check. The chain value is the *current* one; objects
+	// written under different historical params would show as mismatches, which is
+	// a warning only. limewire's params never changed during its lifetime.
+	dc, seg := uint32(*dataChunks), *segmentSize
+	if dc == 0 || seg == 0 {
+		cdc, cseg, perr := ch.RedundancyParams()
+		if perr != nil {
+			log.Printf("WARNING: cannot read EC params from chain (%v); secondary size check disabled unless --data-chunks/--segment-size are given", perr)
+		}
+		if dc == 0 {
+			dc = cdc
+		}
+		if seg == 0 {
+			seg = cseg
+		}
+	}
+	log.Printf("size check: data-chunks=%d segment-size=%d (primary expects payload_size, secondary expects sum of ceil(segment/data-chunks))", dc, seg)
+
 	meta, err := spdb.Open(cfg.SpDB.DSN())
 	if err != nil {
 		return err
@@ -212,8 +260,9 @@ func runPurge(ctx context.Context, args []string) error {
 		cnt.Total, cnt.Done, cnt.Failed, cnt.Remaining(), *dryRun, *retryFailed)
 
 	r := &purge.Runner{
-		Store: store, Chain: chainAdapter{ch}, Meta: meta, Progress: pg,
-		Opt: purge.Options{Bucket: c.bucket, Concurrency: *conc, QPS: *qps, MaxRetry: *maxRetry, DryRun: *dryRun, RetryFailed: *retryFailed},
+		Store: store, Chain: chainAdapter{ch}, Meta: meta, Progress: progressAdapter{pg},
+		Opt: purge.Options{Bucket: c.bucket, Concurrency: *conc, QPS: *qps, MaxRetry: *maxRetry, DryRun: *dryRun, RetryFailed: *retryFailed,
+			DataChunks: dc, SegmentSize: seg},
 	}
 	return r.Run(ctx, cnt.Total)
 }
@@ -324,6 +373,18 @@ func runStatus(ctx context.Context, args []string) error {
 	fmt.Printf("objects   total=%d done=%d failed=%d remaining=%d\n", cnt.Total, cnt.Done, cnt.Failed, cnt.Remaining())
 	fmt.Printf("deleted   keys=%d bytes=%d\n", cnt.DeletedKeys, cnt.DeletedBytes)
 	fmt.Printf("scan      Σ payload_size=%d bytes\n", cnt.ScanBytes)
+	fmt.Printf("size      checked=%d ok=%d mismatch=%d unchecked=%d (done objects: deleted_bytes vs size expected from chain payload)\n",
+		cnt.SizeChecked, cnt.SizeChecked-cnt.SizeMismatch, cnt.SizeMismatch, cnt.Done-cnt.SizeChecked)
+	if cnt.SizeMismatch > 0 {
+		mm, err := pg.Mismatches(ctx, *failures)
+		if err != nil {
+			return err
+		}
+		fmt.Println("size mismatches (oid\trole\tdeleted\texpected):")
+		for _, l := range mm {
+			fmt.Println("  " + l)
+		}
+	}
 	if cnt.Failed > 0 {
 		fails, err := pg.Failures(ctx, *failures)
 		if err != nil {
