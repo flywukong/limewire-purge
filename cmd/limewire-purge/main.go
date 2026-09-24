@@ -188,7 +188,7 @@ func runPurge(ctx context.Context, args []string) error {
 	dryRun := fs.Bool("dry-run", false, "list only; delete nothing; write no progress")
 	conc := fs.Int("concurrency", 8, "objects processed in parallel")
 	qps := fs.Float64("qps", 50, "object-storage requests per second (list + delete)")
-	maxRetry := fs.Int("max-retry", 10, "consecutive no-progress rounds (list/delete errors or all-keys-failed) before an object is marked failed")
+	maxRetry := fs.Int("max-retry", 10, "retries per piece before an object is marked failed (list errors are counted separately); failed objects are re-run once after the main pass")
 	retryFailed := fs.Bool("retry-failed", false, "re-process objects previously marked failed")
 	allowVersioned := fs.Bool("allow-versioned-bucket", false, "proceed even if the bucket has versioning Enabled/Suspended; deletes by key only, so historical versions are not removed and delete markers are left behind — test buckets only")
 	dataChunks := fs.Uint("data-chunks", 0, "EC data chunks for the secondary size check; 0 = read current value from chain")

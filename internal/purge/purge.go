@@ -55,7 +55,7 @@ type Options struct {
 	Bucket      string // Greenfield bucket name the object must belong to
 	Concurrency int
 	QPS         float64
-	MaxRetry    int  // consecutive no-progress rounds (list/delete errors or all-keys-failed) before the object is failed
+	MaxRetry    int  // retries per piece (and consecutive list retries per prefix) before the object is failed
 	DryRun      bool // list only, never delete, never write progress
 	RetryFailed bool
 	// EC layout used to compute a secondary's expected bytes; 0 disables the
@@ -78,6 +78,10 @@ type Runner struct {
 	bytes     atomic.Uint64
 	mismatch  atomic.Uint64
 	total     uint64
+
+	retryPass  atomic.Bool
+	mu         sync.Mutex
+	failedList []Claimed // objects that failed in the current pass
 }
 
 // Result is what one object attempt produced. SKeys/EKeys split Keys by prefix
@@ -88,7 +92,8 @@ type Result struct {
 	Err          error
 }
 
-// Run drains the progress table with Opt.Concurrency workers.
+// Run drains the progress table with Opt.Concurrency workers, then re-runs the
+// objects that failed in this run once more (they are usually transient errors).
 func (r *Runner) Run(ctx context.Context, total uint64) error {
 	if r.Opt.Concurrency <= 0 {
 		r.Opt.Concurrency = 1
@@ -102,18 +107,6 @@ func (r *Runner) Run(ctx context.Context, total uint64) error {
 	r.total = total
 	r.lim = rate.NewLimiter(rate.Limit(r.Opt.QPS), 1)
 
-	ids := make(chan Claimed, r.Opt.Concurrency*2)
-	var wg sync.WaitGroup
-	for i := 0; i < r.Opt.Concurrency; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for c := range ids {
-				r.handle(ctx, c)
-			}
-		}()
-	}
-
 	// heartbeat: overall progress every 30s, so a long-running large object or a
 	// slow bucket never looks like a hang
 	started := time.Now()
@@ -126,41 +119,113 @@ func (r *Runner) Run(ctx context.Context, total uint64) error {
 			case <-hbStop:
 				return
 			case <-t.C:
-				log.Printf("progress: %d/%d processed, %d failed, keys=%d bytes=%d, elapsed=%s",
-					r.processed.Load(), r.total, r.failed.Load(), r.keys.Load(), r.bytes.Load(),
+				log.Printf("progress(%s): %d/%d processed, %d failed, keys=%d bytes=%d, elapsed=%s",
+					r.passName(), r.processed.Load(), r.total, r.failed.Load(), r.keys.Load(), r.bytes.Load(),
 					time.Since(started).Truncate(time.Second))
 			}
 		}
 	}()
 	defer close(hbStop)
 
-	var after uint64
-	var claimErr error
-feed:
-	for {
-		batch, err := r.Progress.Claim(ctx, after, r.Opt.Concurrency*4, r.Opt.RetryFailed)
-		if err != nil {
-			claimErr = err
-			break
+	claimErr := r.work(ctx, func(ids chan<- Claimed) error {
+		var after uint64
+		for {
+			batch, err := r.Progress.Claim(ctx, after, r.Opt.Concurrency*4, r.Opt.RetryFailed)
+			if err != nil {
+				return fmt.Errorf("claim from progress table: %w", err)
+			}
+			if len(batch) == 0 {
+				return nil
+			}
+			for _, c := range batch {
+				select {
+				case ids <- c:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+				after = c.OID
+			}
 		}
-		if len(batch) == 0 {
-			break
-		}
-		for _, c := range batch {
+	})
+	log.Printf("main pass finished: processed=%d failed=%d deleted_keys=%d deleted_bytes=%d size_mismatch=%d",
+		r.processed.Load(), r.failed.Load(), r.keys.Load(), r.bytes.Load(), r.mismatch.Load())
+	if claimErr != nil {
+		log.Printf("ERROR main pass stopped early: %v", claimErr)
+	}
+
+	r.mu.Lock()
+	retry := r.failedList
+	r.failedList = nil
+	r.mu.Unlock()
+	switch {
+	case len(retry) == 0:
+		return claimErr
+	case r.Opt.DryRun:
+		return claimErr
+	case ctx.Err() != nil:
+		log.Printf("retry pass skipped: %v; %d failed objects stay FAILED (use --retry-failed later)", ctx.Err(), len(retry))
+		return claimErr
+	}
+
+	firstFailed := len(retry)
+	log.Printf("retry pass: re-running %d objects that failed in the main pass", firstFailed)
+	r.retryPass.Store(true)
+	r.total = uint64(firstFailed)
+	r.processed.Store(0)
+	r.failed.Store(0)
+	retryErr := r.work(ctx, func(ids chan<- Claimed) error {
+		for _, c := range retry {
 			select {
 			case ids <- c:
 			case <-ctx.Done():
-				claimErr = ctx.Err()
-				break feed
+				return ctx.Err()
 			}
-			after = c.OID
 		}
+		return nil
+	})
+	still := r.failed.Load()
+	log.Printf("retry pass finished: retried=%d recovered=%d still_failed=%d", r.processed.Load(), r.processed.Load()-still, still)
+	if retryErr != nil {
+		log.Printf("ERROR retry pass stopped early: %v", retryErr)
 	}
+	r.mu.Lock()
+	left := r.failedList
+	r.mu.Unlock()
+	for _, c := range left {
+		log.Printf("still FAILED oid=%d (reason in purge_progress.fail_reason; rerun with --retry-failed)", c.OID)
+	}
+	log.Printf("finished: deleted_keys=%d deleted_bytes=%d size_mismatch=%d failed_after_retry=%d",
+		r.keys.Load(), r.bytes.Load(), r.mismatch.Load(), still)
+	if claimErr != nil {
+		return claimErr
+	}
+	return retryErr
+}
+
+// work runs Opt.Concurrency workers over whatever feed pushes into the channel.
+func (r *Runner) work(ctx context.Context, feed func(chan<- Claimed) error) error {
+	ids := make(chan Claimed, r.Opt.Concurrency*2)
+	var wg sync.WaitGroup
+	for i := 0; i < r.Opt.Concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for c := range ids {
+				r.handle(ctx, c)
+			}
+		}()
+	}
+	err := feed(ids)
 	close(ids)
 	wg.Wait()
-	log.Printf("finished: processed=%d failed=%d deleted_keys=%d deleted_bytes=%d size_mismatch=%d",
-		r.processed.Load(), r.failed.Load(), r.keys.Load(), r.bytes.Load(), r.mismatch.Load())
-	return claimErr
+	return err
+}
+
+func (r *Runner) passName() string {
+	if r.retryPass.Load() {
+		return "retry"
+	}
+	return "main"
 }
 
 func (r *Runner) handle(ctx context.Context, c Claimed) {
@@ -180,15 +245,18 @@ func (r *Runner) handle(ctx context.Context, c Claimed) {
 	}
 	if res.Err != nil {
 		r.failed.Add(1)
-		log.Printf("[%d/%d] oid=%d FAILED keys=%d bytes=%d %.1fs: %v", n, r.total, oid, res.Keys, res.Bytes, time.Since(start).Seconds(), res.Err)
+		r.mu.Lock()
+		r.failedList = append(r.failedList, c)
+		r.mu.Unlock()
+		log.Printf("[%s %d/%d] oid=%d FAILED keys=%d bytes=%d %.1fs: %v", r.passName(), n, r.total, oid, res.Keys, res.Bytes, time.Since(start).Seconds(), res.Err)
 		if err := r.Progress.Fail(ctx, oid, res.Keys, res.Bytes, res.Err.Error()); err != nil {
-			log.Printf("oid=%d: cannot record failure: %v", oid, err)
+			log.Printf("ERROR oid=%d: cannot record failure in progress table: %v", oid, err)
 		}
 		return
 	}
-	log.Printf("[%d/%d] oid=%d done keys=%d bytes=%d %s size=%s %.1fs", n, r.total, oid, res.Keys, res.Bytes, check, verdict, time.Since(start).Seconds())
+	log.Printf("[%s %d/%d] oid=%d done keys=%d bytes=%d %s size=%s %.1fs", r.passName(), n, r.total, oid, res.Keys, res.Bytes, check, verdict, time.Since(start).Seconds())
 	if err := r.Progress.Done(ctx, oid, res.Keys, res.Bytes, check); err != nil {
-		log.Printf("oid=%d: cannot record completion: %v", oid, err)
+		log.Printf("ERROR oid=%d: cannot record completion in progress table: %v", oid, err)
 	}
 }
 
@@ -205,7 +273,7 @@ func (r *Runner) verdict(oid uint64, res Result, check SizeCheck, payload uint64
 		return "ANOMALY"
 	case !check.Known:
 		return "skip"
-	case r.Opt.RetryFailed:
+	case r.Opt.RetryFailed || r.retryPass.Load():
 		// this attempt only removes what an earlier attempt left; the cumulative
 		// comparison in `status` is the authoritative one
 		return "see-status"
@@ -290,7 +358,7 @@ func (r *Runner) ProcessOne(ctx context.Context, oid uint64) Result {
 
 // clearPrefix lists from the start of prefix and deletes what it sees, until the
 // listing comes back empty. Whatever a failed batch leaves behind is simply listed
-// again next round, so no per-key bookkeeping is needed.
+// again next round.
 func (r *Runner) clearPrefix(ctx context.Context, oid uint64, prefix string) (keys, bytes uint64, err error) {
 	if r.Opt.DryRun {
 		err = r.Store.ListAll(ctx, prefix, func(objs []s3store.Object) error {
@@ -305,27 +373,24 @@ func (r *Runner) clearPrefix(ctx context.Context, oid uint64, prefix string) (ke
 		return keys, bytes, err
 	}
 
-	// attempts counts consecutive rounds that made no progress (a failed list, a
-	// failed delete request, or a delete where every key errored). Any round that
-	// deletes at least one key resets it to 0. Re-listing from the prefix start
-	// means each retry naturally targets only the keys still left, i.e. the
-	// unsuccessful portion. Only after MaxRetry consecutive stuck rounds is the
-	// object given up as failed; the remaining keys stay in the bucket for a
-	// later run. Intermediate failures are logged, not written to the DB.
-	attempts := 0
+	// Retries are counted per piece: fails[key] is how many times that key has
+	// failed to delete (a whole-request error counts once for every key in the
+	// batch). Other keys succeeding does not reset it. Once a key exceeds MaxRetry
+	// the object is given up as failed; every other deletable piece has been
+	// removed by then, the stuck ones stay for a later run. List errors have their
+	// own consecutive counter, reset by any successful list. Re-listing from the
+	// prefix start each round means a retry targets only the keys still present.
+	fails := map[string]int{}
+	listFails := 0
 	round := 0
-	giveUp := func(format string, args ...any) error {
-		return fmt.Errorf(format, args...)
-	}
-	backoff := func() error {
+	backoff := func(n int) error {
 		if r.lim == nil { // rate limiting disabled (offline tests) — don't sleep
 			return ctx.Err()
 		}
-		shift := attempts
-		if shift > 6 {
-			shift = 6 // cap growth
+		if n > 6 {
+			n = 6 // cap growth
 		}
-		d := time.Duration(1<<shift) * 500 * time.Millisecond
+		d := time.Duration(1<<n) * 500 * time.Millisecond
 		if d > 30*time.Second {
 			d = 30 * time.Second
 		}
@@ -343,17 +408,22 @@ func (r *Runner) clearPrefix(ctx context.Context, oid uint64, prefix string) (ke
 		}
 		objs, lerr := r.Store.List(ctx, prefix, 1000)
 		if lerr != nil {
-			attempts++
-			if attempts > r.Opt.MaxRetry {
-				return keys, bytes, giveUp("list %s failed after %d retries: %w", prefix, r.Opt.MaxRetry, lerr)
+			listFails++
+			if listFails > r.Opt.MaxRetry {
+				log.Printf("oid=%d %s: list error, giving up after %d retries: %v", oid, prefix, r.Opt.MaxRetry, lerr)
+				return keys, bytes, fmt.Errorf("list %s failed after %d retries: %w", prefix, r.Opt.MaxRetry, lerr)
 			}
-			log.Printf("oid=%d %s: list error (retry %d/%d): %v", oid, prefix, attempts, r.Opt.MaxRetry, lerr)
-			if err := backoff(); err != nil {
+			log.Printf("oid=%d %s: list error (retry %d/%d): %v", oid, prefix, listFails, r.Opt.MaxRetry, lerr)
+			if err := backoff(listFails); err != nil {
 				return keys, bytes, err
 			}
 			continue
 		}
+		listFails = 0
 		if len(objs) == 0 {
+			if len(fails) > 0 {
+				log.Printf("oid=%d %s: cleared; %d pieces needed retries", oid, prefix, len(fails))
+			}
 			return keys, bytes, nil
 		}
 		size := make(map[string]int64, len(objs))
@@ -365,46 +435,71 @@ func (r *Runner) clearPrefix(ctx context.Context, oid uint64, prefix string) (ke
 		batch, dropped := pieceop.KeepOnly(all, oid) // fresh slice every round
 		if len(dropped) > 0 {
 			// a correctness violation, not a transient failure — never retry
+			log.Printf("ERROR oid=%d %s: listing returned %d keys of another object, e.g. %s; refusing to continue", oid, prefix, len(dropped), strings.Join(dropped[:min(3, len(dropped))], ","))
 			return keys, bytes, fmt.Errorf("listing under %s returned keys of another object (%s); refusing to continue", prefix, strings.Join(dropped[:min(3, len(dropped))], ","))
 		}
 		if err := r.wait(ctx); err != nil {
 			return keys, bytes, err
 		}
 		deleted, failed, derr := r.Store.Delete(ctx, batch)
+		ok := make(map[string]bool, len(deleted))
 		for _, k := range deleted {
+			ok[k] = true
 			keys++
 			bytes += uint64(size[k])
-		}
-		if len(deleted) > 0 {
-			attempts = 0 // progress made this round
+			delete(fails, k)
 		}
 		// one line per round so a large object visibly advances instead of looking hung
 		log.Printf("oid=%d %s: round %d listed=%d deleted=%d failed=%d (prefix total keys=%d bytes=%d)",
-			oid, prefix, round, len(batch), len(deleted), len(failed), keys, bytes)
+			oid, prefix, round, len(batch), len(deleted), len(batch)-len(deleted), keys, bytes)
+
+		// what failed this round, and why
+		reason := map[string]string{}
 		if derr != nil {
-			if len(deleted) == 0 {
-				attempts++
+			log.Printf("oid=%d %s: delete request error, all %d undeleted keys in the batch count one failure: %v", oid, prefix, len(batch)-len(deleted), derr)
+			for _, k := range batch {
+				if !ok[k] {
+					reason[k] = derr.Error()
+				}
 			}
-			if attempts > r.Opt.MaxRetry {
-				return keys, bytes, giveUp("delete %s failed after %d retries: %w", prefix, r.Opt.MaxRetry, derr)
+		} else {
+			for _, e := range failed {
+				reason[e.Key] = e.Code + " " + e.Message
 			}
-			log.Printf("oid=%d %s: delete request error (retry %d/%d): %v", oid, prefix, attempts, r.Opt.MaxRetry, derr)
-			if err := backoff(); err != nil {
-				return keys, bytes, err
-			}
-			continue
 		}
-		if len(failed) == 0 {
+		if len(reason) == 0 {
 			continue // whole batch deleted; re-list for the next page
 		}
-		if len(deleted) == 0 {
-			attempts++
+		worst, logged := 0, 0
+		var stuck []string
+		for _, k := range batch { // batch order keeps the log stable
+			why, bad := reason[k]
+			if !bad {
+				continue
+			}
+			fails[k]++
+			if fails[k] > worst {
+				worst = fails[k]
+			}
+			if fails[k] > r.Opt.MaxRetry {
+				stuck = append(stuck, k)
+			}
+			if logged < 5 {
+				log.Printf("oid=%d piece %s delete failed (attempt %d/%d): %s", oid, k, fails[k], r.Opt.MaxRetry+1, why)
+				logged++
+			}
 		}
-		if attempts > r.Opt.MaxRetry {
-			return keys, bytes, giveUp("%d keys under %s keep failing after %d retries, first: %s", len(failed), prefix, r.Opt.MaxRetry, failed[0])
+		if len(reason) > logged {
+			log.Printf("oid=%d %s: ... and %d more pieces failed this round", oid, prefix, len(reason)-logged)
 		}
-		log.Printf("oid=%d %s: %d/%d keys failed (retry %d/%d), first: %s", oid, prefix, len(failed), len(batch), attempts, r.Opt.MaxRetry, failed[0])
-		if err := backoff(); err != nil {
+		if len(stuck) > 0 {
+			for _, k := range stuck[:min(10, len(stuck))] {
+				log.Printf("oid=%d piece %s: giving up after %d attempts, last error: %s", oid, k, fails[k], reason[k])
+			}
+			return keys, bytes, fmt.Errorf("%d pieces under %s still failing after %d retries, first %s: %s",
+				len(stuck), prefix, r.Opt.MaxRetry, stuck[0], reason[stuck[0]])
+		}
+		if err := backoff(worst); err != nil {
 			return keys, bytes, err
 		}
 	}

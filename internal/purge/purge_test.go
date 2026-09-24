@@ -21,10 +21,12 @@ type fakeStore struct {
 	deleteErrN int            // remaining whole-request delete errors to inject (-1 = forever)
 	maxBatch   int            // largest batch seen
 	lists      int
+	listErrN   int            // remaining List errors to inject
+	tries      map[string]int // key -> delete attempts seen
 }
 
 func newFakeStore(keys ...string) *fakeStore {
-	f := &fakeStore{objs: map[string]int64{}, failKeys: map[string]int{}}
+	f := &fakeStore{objs: map[string]int64{}, failKeys: map[string]int{}, tries: map[string]int{}}
 	for _, k := range keys {
 		f.objs[k] = 10
 	}
@@ -46,6 +48,10 @@ func (f *fakeStore) List(_ context.Context, prefix string, max int32) ([]s3store
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.lists++
+	if f.listErrN > 0 {
+		f.listErrN--
+		return nil, errors.New("SlowDown: injected")
+	}
 	var out []s3store.Object
 	for _, k := range f.sorted(prefix) {
 		if int32(len(out)) >= max {
@@ -89,6 +95,7 @@ func (f *fakeStore) Delete(_ context.Context, keys []string) ([]string, []s3stor
 	var deleted []string
 	var failed []s3store.KeyError
 	for _, k := range keys {
+		f.tries[k]++
 		if n := f.failKeys[k]; n > 0 {
 			f.failKeys[k] = n - 1
 			failed = append(failed, s3store.KeyError{Key: k, Code: "InternalError", Message: "injected"})
@@ -249,22 +256,67 @@ func TestPartialFailureRetried(t *testing.T) {
 	}
 }
 
-// Keys that never stop failing: the object is failed after MaxRetry stuck rounds,
-// and what did get deleted is still counted.
+// A key that never stops failing: the object is failed once that key used up its
+// 1+MaxRetry attempts, and what did get deleted is still counted.
 func TestPersistentFailureGivesUp(t *testing.T) {
 	st := newFakeStore("s9_s0", "s9_s1", "s9_s2")
 	st.failKeys["s9_s2"] = 1000
 	r := newRunner(st, fakeChain{map[uint64]string{9: "limewire"}}, &fakeMeta{rows: map[uint64]bool{}})
 	r.lim = nil
 	res := r.ProcessOne(context.Background(), 9)
-	if res.Err == nil || !strings.Contains(res.Err.Error(), "keep failing") {
+	if res.Err == nil || !strings.Contains(res.Err.Error(), "still failing after 3 retries") {
 		t.Fatalf("expected give-up error, got %+v", res)
+	}
+	if st.tries["s9_s2"] != 4 {
+		t.Fatalf("stuck key tried %d times, want 1+MaxRetry=4", st.tries["s9_s2"])
 	}
 	if res.Keys != 2 {
 		t.Fatalf("partial progress not counted: %+v", res)
 	}
 	if len(st.sorted("s9_")) != 1 {
 		t.Fatal("the failing key must remain for the next attempt")
+	}
+}
+
+// Retries are per piece: 2500 keys, one never deletes. Every other key is removed,
+// the stuck one is tried exactly 1+MaxRetry times even though other keys kept
+// succeeding in the same rounds.
+func TestPerPieceRetryCount(t *testing.T) {
+	var keys []string
+	for i := 0; i < 2500; i++ {
+		keys = append(keys, fmt.Sprintf("s13_s%04d", i))
+	}
+	st := newFakeStore(keys...)
+	st.failKeys["s13_s0000"] = 1000
+	r := newRunner(st, fakeChain{map[uint64]string{13: "limewire"}}, &fakeMeta{rows: map[uint64]bool{}})
+	r.lim = nil
+	res := r.ProcessOne(context.Background(), 13)
+	if res.Err == nil || res.Keys != 2499 {
+		t.Fatalf("res=%+v", res)
+	}
+	if st.tries["s13_s0000"] != 1+r.Opt.MaxRetry {
+		t.Fatalf("stuck key tried %d times, want %d", st.tries["s13_s0000"], 1+r.Opt.MaxRetry)
+	}
+	if left := st.sorted("s13_"); len(left) != 1 || left[0] != "s13_s0000" {
+		t.Fatalf("left=%v", left)
+	}
+}
+
+// List errors have their own counter: a few are retried, then the object completes.
+func TestListErrorRetried(t *testing.T) {
+	st := newFakeStore("s14_s0")
+	st.listErrN = 3 // MaxRetry is 3, so exactly at the limit still recovers
+	r := newRunner(st, fakeChain{map[uint64]string{14: "limewire"}}, &fakeMeta{rows: map[uint64]bool{}})
+	r.lim = nil
+	res := r.ProcessOne(context.Background(), 14)
+	if res.Err != nil || res.Keys != 1 {
+		t.Fatalf("res=%+v", res)
+	}
+	st.objs["s14_s1"] = 10
+	st.listErrN = 4 // one more than MaxRetry → give up
+	res = r.ProcessOne(context.Background(), 14)
+	if res.Err == nil || !strings.Contains(res.Err.Error(), "list") {
+		t.Fatalf("expected list give-up, got %+v", res)
 	}
 }
 
@@ -347,5 +399,32 @@ func TestRunEndToEnd(t *testing.T) {
 	}
 	if len(st.sorted("s3_")) != 1 {
 		t.Fatal("object of another bucket must be untouched")
+	}
+}
+
+// An object that fails the main pass is re-run once automatically; a transient
+// fault recovers there, a permanent one stays FAILED.
+func TestRunAutoRetryPass(t *testing.T) {
+	st := newFakeStore("s1_s0", "s2_s0", "s3_s0")
+	st.failKeys["s2_s0"] = 2    // MaxRetry=1: fails both main-pass attempts, then deletes
+	st.failKeys["s3_s0"] = 1000 // never deletes
+	pg := &fakeProgress{pending: []uint64{1, 2, 3}, done: map[uint64][2]uint64{}, failed: map[uint64]string{}}
+	r := newRunner(st, fakeChain{map[uint64]string{1: "limewire", 2: "limewire", 3: "limewire"}}, &fakeMeta{rows: map[uint64]bool{}})
+	r.Progress = pg
+	r.Opt.MaxRetry = 1
+	if err := r.Run(context.Background(), 3); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := pg.done[2]; !ok {
+		t.Fatalf("oid 2 should recover in the retry pass: done=%v failed=%v", pg.done, pg.failed)
+	}
+	if _, ok := pg.failed[3]; !ok {
+		t.Fatalf("oid 3 should stay failed: %v", pg.failed)
+	}
+	if st.tries["s3_s0"] != 4 {
+		t.Fatalf("permanent key tried %d times, want 2 per pass × 2 passes", st.tries["s3_s0"])
+	}
+	if r.failed.Load() != 1 {
+		t.Fatalf("failed after retry = %d, want 1", r.failed.Load())
 	}
 }

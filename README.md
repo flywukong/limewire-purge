@@ -43,7 +43,7 @@ flowchart TD
     K --> S["status：汇总 done / failed / remaining<br/>与累计 deleted_keys / bytes"]
 ```
 
-护栏：`purge` / `verify` 启动先查 `GetBucketVersioning`，版本控制 Enabled/Suspended 或查不到即中止；`PieceStore.Shards > 1` 直接拒绝。中断后原命令重跑即续，失败项用 `--retry-failed` 单独重试。
+护栏：`purge` / `verify` 启动先查 `GetBucketVersioning`，版本控制 Enabled/Suspended 或查不到即中止；`PieceStore.Shards > 1` 直接拒绝。中断后原命令重跑即续；本次失败的 oid 在主轮后自动补跑一遍，仍失败的用 `--retry-failed` 单独重试。
 
 ## 命令详解
 
@@ -127,7 +127,7 @@ secondary 公式可逐字节复现 SP 的实际存储（本地 3+3 实测：5 Mi
 
 对不上只打 `WARNING` 并记入进度表，**不影响 DONE 判定**：字节已经删掉，拦截也不可逆。`status` 的 `size` 一行给出 checked / ok / mismatch / unchecked，并列出不符的 oid。比对以进度表里的累计 `deleted_bytes` 为准，所以中断重试后的对象也能正确比对；但中断前已删、未落库的字节无从统计，这类对象可能显示为 mismatch。另外链上参数若在对象写入后变过，历史对象也会显示为 mismatch（limewire 存续期间参数未变）。
 
-运行时日志，用于判断是否卡住：领到对象时打 `oid=X start`；每一轮批删后打一行 `oid=X s55_: round N listed=… deleted=… (prefix total keys=… bytes=…)`，大对象会连续出现多轮；每 30 秒一条总进度心跳 `progress: n/total processed, failed=…, keys=…, elapsed=…`；对象完成或失败时打 `[n/total] oid=X done|FAILED …`。
+运行时日志，用于判断是否卡住：领到对象时打 `oid=X start`；每一轮批删后打一行 `oid=X s55_: round N listed=… deleted=… (prefix total keys=… bytes=…)`，大对象会连续出现多轮；每 30 秒一条总进度心跳 `progress: n/total processed, failed=…, keys=…, elapsed=…`；对象完成或失败时打 `[main|retry n/total] oid=X done|FAILED …`。失败相关日志：每个删不掉的 piece 打 `oid=X piece <key> delete failed (attempt a/b): <错误码>`（每轮最多 5 条，其余汇总成一行）；放弃时打 `giving up after N attempts`；列举报错、整批请求报错、串号 key、进度表写入失败都各有一行，写库失败以 `ERROR` 开头。主轮结束打 `main pass finished`，补跑结束打 `retry pass finished: retried/recovered/still_failed`。
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
@@ -139,7 +139,7 @@ secondary 公式可逐字节复现 SP 的实际存储（本地 3+3 实测：5 Mi
 | `--dry-run` | `false` | 只查链 + 列举命中，不删、不写进度 |
 | `--concurrency` | `8` | 并发处理的 oid 数（不是单批 key 数） |
 | `--qps` | `50` | S3 列举/删除限速；不含链查询和 SDK 内部重试 |
-| `--max-retry` | `10` | 单 oid 连续无进展的退避重试轮数上限（列举错误、删除请求错误、整批 key 全失败都计入；一轮有 key 删成功即清零） |
+| `--max-retry` | `10` | 每个 piece 删除失败的重试上限，超过即该 oid 记 FAILED；列举报错另计，连续超过同样上限才放弃 |
 | `--retry-failed` | `false` | 只重试 `status=2` 的对象 |
 | `--data-chunks` | `0` | 大小对账用的 EC 数据分片数，0 表示从链上读 |
 | `--segment-size` | `0` | 大小对账用的最大段大小，0 表示从链上读 |
@@ -419,7 +419,15 @@ Greenfield 的 `_v<n>` key 后缀被同一前缀覆盖，与 S3 云版本控制�
 
 ### 5.5 中断恢复与失败重试
 
-单个 oid 内部先自愈：某一批删除失败（列举错误、删除请求错误、或整批 key 全部失败）时，退避后重新列举该前缀——列出来的正好只剩没删成功的部分——再删，最多连续 `--max-retry`（默认 10）轮无进展才把该 oid 记为 `status=2`，其间只打日志、不写进度表；一轮只要有 key 删成功，计数即清零。达到上限后保留该 oid 的元数据、继续处理其他 oid。跨命令的重试如下：
+单个 oid 内部先自愈，重试**按 piece 计数**：
+
+- 每轮从前缀起点重新列举，列出来的正好只剩没删成功的 key，一起再删一次。
+- 每个 key 各自记失败次数；别的 key 删成功不会清零它的次数。整个删除请求报错时，这批没删掉的 key 各记一次。
+- 某个 key 累计失败超过 `--max-retry`（默认 10，即最多尝试 11 次）时，该 oid 记为 `status=2`；此时其他能删的 piece 都已删完，卡住的留在桶里。
+- 列举报错单独计数，连续超过 `--max-retry` 次才放弃，列举成功一次即清零。
+- 两轮之间按失败次数指数退避，上限 30 秒。中途失败只打日志、不写进度表。放弃后保留该 oid 的元数据，继续处理其他 oid。
+
+主轮跑完后，工具**自动把本次失败的 oid 再补跑一遍**，每个 piece 的计数从零开始。补跑仍失败的保持 `status=2`，日志逐个列出 `still FAILED oid=…`。之前运行遗留的失败项不在自动补跑范围内，要用 `--retry-failed`。跨命令的重试如下：
 
 - 原参数重跑普通 `purge`：仅处理没有进度记录的 oid，跳过已完成和已记录失败项。
 - `purge --retry-failed`：仅重试 `status=2` 的失败项，不会顺带处理未处理项。
@@ -475,7 +483,7 @@ Greenfield 的 `_v<n>` key 后缀被同一前缀覆盖，与 S3 云版本控制�
 | `--dry-run` | purge | `false`；只预览所选集合 |
 | `--concurrency` | purge | `8`，同时处理的 oid 数，不是单批 key 数 |
 | `--qps` | purge / verify | `50`，存储列举/删除路径的限速参数；不是链查询/MySQL 的统一限速，也不含 SDK 内部重试的精确请求计数 |
-| `--max-retry` | purge | `10`，单 oid 连续无进展的退避重试轮数上限（列举错误、删除请求错误、整批 key 全失败都计入）；一轮删成功即清零，不是每类请求各自的重试次数 |
+| `--max-retry` | purge | `10`，每个 piece 删除失败的重试上限（整批请求报错时这批 key 各记一次）；列举报错另计连续次数；主轮结束后本次失败的 oid 自动补跑一遍 |
 | `--retry-failed` | purge | `false`；开启后只选失败项 |
 | `--out` | verify | `./residue.tsv`，会覆盖同名文件 |
 | `--failures` | status | `20`，显示最近失败原因的条数 |
