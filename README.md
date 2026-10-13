@@ -1,118 +1,147 @@
 # limewire-purge
 
-按 SP 部署的物理数据清理工具：从本 SP 的索引数据库获取指定 Greenfield bucket 的 object ID，
-逐个查链确认归属，再删除本 SP 对应的 S3 piece 和本地元数据，用独立 MySQL 表记录进度。
+按 SP 部署的物理清理工具：先全量扫描指定 Greenfield bucket 的 OID，封存到工具 MySQL；再按逻辑容量分配子任务，逐对象查链、批删 piece、清理本地元数据，最后独立验收该子任务。
 
-**这是不可逆的物理删除，不是链上的 DeleteObject / DiscontinueObject。** 工具不发送交易，
-不删除链上 object/bucket，不停止计费，也不自动停用 challenge。链上对象可能仍为 SEALED，
-但文件已经无法正常读取。仅用于已确认废弃、已授权清理的 bucket。
+**不可逆物理删除，不是链上 DeleteObject / DiscontinueObject。** 不发送交易、不停止计费、不自动停用 challenge。仅用于已授权废弃 bucket；链上仍可能是 SEALED，但物理文件已无法读取。
 
 ## 工作流程
 
-每个 SP 各跑一份，同一份代码只有配置不同。`scan` 从 BSDB 导出名单，`purge` 逐 oid 处理并把结果写进度库，`verify` / `status` 只读复查与汇总。
+```text
+scan 全量落库 → 数量对账 → COMPLETE 封存
+    ↓
+task create：按约 500 GiB（可配置）固定本批 OID
+    ↓
+purge --execute：仅当前任务，逐 OID 查链 → 批删 → 清本地元数据 → 记进度
+    ↓
+verify：独立检查当前任务两个前缀 + 本地元数据，逐 OID 保存验收结果
+    ├─ ERROR：重跑 verify，跳过本代次已 PASS 的对象
+    ├─ RESIDUE：重跑 purge 清残留，再 verify 整批
+    └─ 全部 PASS：DONE，可以 task create 下一批
 
-```mermaid
-flowchart TD
-    subgraph SCAN["scan（每个 SP 一次）"]
-        A["读 BSDB objects_NN<br/>NN = murmur3(bucket) % 64<br/>过滤 bucket_id + name + removed=0"] --> B["写进度库 scan_objects<br/>INSERT IGNORE 名单"]
-    end
-
-    B --> C["purge 领取未处理 oid<br/>scan_objects 左连接 purge_progress<br/>无进度行即待删"]
-
-    subgraph LOOP["purge 单 oid 状态机（并发处理多个 oid）"]
-        direction TB
-        D["① 查链 head object by id"] --> E{"bucket 名与 ID<br/>是否为目标?"}
-        E -->|"否 / 查不到"| X["写 purge_progress status=2<br/>一条都不删"]
-        E -->|"是"| F["② 列举 s&lt;oid&gt;_ 与 e&lt;oid&gt;_<br/>两个前缀都扫，不按角色跳过"]
-        F --> G["③ 校验 key 的 oid<br/>批删每批不超过 1000，按 qps 限速"]
-        G --> H{"从头再列举<br/>是否还有 key?"}
-        H -->|"有"| G
-        H -->|"连续无进展超上限"| X
-        H -->|"两前缀已空"| I["④ 复查两前缀为空"]
-        I -->|"有残留"| X
-        I -->|"空"| J["⑤ 删 integrity_meta_NN 与 piece_hash<br/>按 object_id，删后复查"]
-        J -->|"仍有"| X
-        J -->|"干净"| K["写 purge_progress status=1<br/>累加 deleted_keys 与 bytes"]
-    end
-
-    C --> D
-    K --> C
-    X --> C
-
-    K --> V["verify：忽略进度，重扫全部 oid<br/>两前缀加元数据，输出残留 residue.tsv"]
-    K --> S["status：汇总 done / failed / remaining<br/>与累计 deleted_keys / bytes"]
+处理不了的 OID → 人工 task defer --oid … --reason …
+    → 不计 PASS，保留在延期池
+    → 其余对象验收通过：DONE_WITH_EXCEPTIONS，可继续下一批
+    → 后续 task create --retry-deferred 显式重试延期池
 ```
 
-护栏：`purge` / `verify` 启动先查 `GetBucketVersioning`，版本控制 Enabled/Suspended 或查不到即中止；`PieceStore.Shards > 1` 直接拒绝。中断后原命令重跑即续；本次失败的 oid 在主轮后自动补跑一遍，仍失败的用 `--retry-failed` 单独重试。
+无需人工记录 task ID：`purge / verify / task defer / task resume` 默认选择唯一未完成任务。重复 `task create` 返回现有未完成任务，不会另开一批。没有当前任务时，`purge --execute` 报错并提示先运行 `task create`，绝不自动创建。
 
-## 命令详解
+正式删除脚本建议带 `--task-id N`，固定为人工检查过的任务 ID：对 `purge / task defer / task resume`，这个参数必须等于当前任务 ID，否则拒绝执行，而不是切换到另一批。`task exclude` 是 `task defer` 的别名，同样记原因、留在延期池、不算 PASS。
 
-四个子命令碰的数据库不同：`scan` 读 BSDB、写进度库；`purge` 读进度库、查链、删 S3、删 SpDB，把结果写回进度库；`verify` 读进度库、只读 S3 和 SpDB；`status` 只读进度库。
+`task create / purge / verify` 选定任务后的首条日志打印 `task=N`、对象数和逻辑容量，后续处理日志也带任务 ID。默认 `verify` 在没有待验收任务时明确报错；历史查询用 `status --task-id N`，历史重新验收用 `verify --task-id N --restart`（不得有其他未完成任务）。
 
-| 命令 | BSDB | 链 RPC | S3 物理桶 | SpDB | 进度库 |
-|---|---|---|---|---|---|
-| `scan` | 读 | — | — | — | 写 `scan_objects` |
-| `purge` | — | 读 | 列举 + 删除 | 删除 | 读名单，写 `purge_progress` |
-| `verify` | — | — | 只读列举 | 只读 | 读名单，写 residue 文件 |
-| `status` | — | — | — | — | 只读汇总 |
+本版本不自动连续执行。试运行后可把任务调大，例如 `--target-size 5TiB --max-objects 100000`（仍可能先达到对象数上限）；以后可用外部脚本串联，但必须检查验收结果、安全暂停和延期项，不能只写无限循环。
 
-### `scan` — 从 BSDB 导出名单
+## 操作命令
 
-把目标 bucket 的全部 objectID 从**本 SP 的 BSDB 索引库**读出来，写进**工具自己的进度库** `scan_objects` 表。只读 BSDB，不删任何数据。
-
-涉及两个库，指定方式不同：
-
-- BSDB（数据源）：不在命令行直接给，从 `--config` 的 TOML `[BsDB]` 段读，可被 `BS_DB_USER/PASSWORD/ADDRESS/DATABASE` 环境变量覆盖。
-- 进度库（写入目标）：用 `--progress-dsn` 直接给完整 MySQL DSN。
-
-执行步骤：
-
-1. 解析 `--config`，按 `objects_NN`（`NN = murmur3(桶名) % 64`）定位 BSDB 中该桶所在的分表。
-2. 先跑一次 `COUNT(*)` 作为连通性与数量心跳（`--count-only` 时到此结束，不写进度库）。
-3. 按源表主键 `id` 游标分批（`--batch`，默认 5000）拉取，筛选 `bucket_id + bucket_name + removed=0`，`INSERT IGNORE` 进 `scan_objects`。
-
-| 参数 | 默认 | 说明 |
-|---|---|---|
-| `--config` | 必填 | SP TOML，读 `[BsDB]` |
-| `--progress-dsn` | 必填（`--count-only` 时不需要） | 进度库 DSN |
-| `--bucket` | `limewire` | 逻辑 bucket 名，建议显式指定 |
-| `--bucket-id` | `42268` | 十进制 bucket ID，建议显式指定 |
-| `--batch` | `5000` | 每次查 BSDB 的行数，正整数；不是 S3 删除批大小 |
-| `--count-only` | `false` | 只打印 BSDB 计数，不写库、不建表 |
+下面仅为示例，不会自动执行。替换所有测试参数，并检查创建任务时打印的范围及容量。
 
 ```bash
-# 只数一下（只连 BSDB）
-./limewire-purge scan --config ~/.local/sp0/config.toml \
-  --bucket purge-test --bucket-id <ID> --count-only
+# Bash / Zsh；DSN 用现有安全机制注入，不在仓库中保存密码。
+: "${PURGE_PROGRESS_DSN:?请设置本 SP 的独立进度库 DSN}"
+purge_common=(
+  --config /path/to/sp0/config.toml
+  --progress-dsn "$PURGE_PROGRESS_DSN"
+  --bucket purge-test
+  --bucket-id 123
+)
+purge_chain=(
+  --chain-rpc http://127.0.0.1:26657
+  --chain-id greenfield_9000-121
+)
 
-# 导入名单（连 BSDB + 进度库）
-./limewire-purge scan --config ~/.local/sp0/config.toml \
-  --progress-dsn 'root:<pw>@tcp(127.0.0.1:3306)/limewire_purge_sp0' \
-  --bucket purge-test --bucket-id <ID> --batch 5000
+# 每个 SP 全量扫描一次，成功后名单封存。
+./limewire-purge scan "${purge_common[@]}" --batch 5000
+
+# 先小规模真实试运行；create 不会删除任何业务数据。
+./limewire-purge task create "${purge_common[@]}" --target-size 1GiB --max-objects 100
+./limewire-purge status "${purge_common[@]}"
+./limewire-purge purge "${purge_common[@]}" "${purge_chain[@]}" --execute --concurrency 1 --qps 5
+./limewire-purge verify "${purge_common[@]}" --qps 5
+
+# 本批完成后再选下一批；容量指逻辑 payload，不是本 SP 释放空间。
+./limewire-purge task create "${purge_common[@]}" --target-size 500GiB
+./limewire-purge purge "${purge_common[@]}" "${purge_chain[@]}" --execute --concurrency 2 --qps 10
+./limewire-purge verify "${purge_common[@]}" --qps 10
+./limewire-purge status "${purge_common[@]}"
 ```
 
-`INSERT IGNORE` 使重跑安全：补入新 oid，不覆盖已有行、不清进度。日志里的 `rows written` 是本次提交的行数（含被忽略的重复），不等于新增行数。名单是对象数，不是 S3 key 数——一个对象可能对应多段或多个 EC 分片。
+`purge` 必须提供 `--execute` 才真实删除；可选 `--dry-run` 仅预览当前任务待处理项，发现异常非零退出，但继续列出其他对象的问题。dry-run 不写对象处理结果，不是正式删除的前置条件；仍会取得工具锁并检查/初始化进度表。
 
-### `purge` — 逐对象删除
+### 失败和中断恢复
 
-从进度库领取还没处理的 oid，逐个删除本 SP 对应的 S3 piece 和 SpDB 元数据，结果写回进度库。这是不可逆物理删除，**没有二次确认，`--dry-run` 默认关闭**。
+| 情况 | 操作 |
+|---|---|
+| 删除中断、网络错误、piece 重试耗尽 | 原 `purge … --execute` 重跑；自动领取当前任务未处理及失败项 |
+| 验收中断或 ERROR | 原 `verify …` 重跑，续验本代次未 PASS 的 OID |
+| 验收发现 RESIDUE | 原 `purge … --execute` 重清理，再 `verify …`；旧验收代次整体失效 |
+| SAFETY_HOLD | 查清原因后 `task resume … --reason '处理依据'`，再运行；不能绕过身份/名单/key 校验 |
+| 个别对象长期无法处理 | `task defer … --oid 123 --reason '原因与后续安排'`，继续处理其余对象，再 verify |
+| 后续处理延期项 | 当前任务完成后 `task create … --retry-deferred --target-size 500GiB` |
+| 重新完整验收历史任务 | 无其他未完成任务时 `verify … --task-id N --restart` |
 
-碰四个地方：进度库（读名单 + 写结果）、链 RPC（每个 oid 删前查归属）、S3 物理桶（列举 + 批删）、SpDB（删元数据）。链和 S3 的指定：
+普通失败不用 `task resume`；旧 `--retry-failed` 参数仅兼容，已不再改变领取范围。
+`task defer` 只改变工具调度，不删数据、不更新冻结快照、不计 PASS；记录原因、时间并追加 `task_events`。
+某 OID 引发的安全暂停可通过明确延期该 OID 解除；全局或其他 OID 的安全暂停不能这样绕过。
+若冻结快照本身已改变，resume 仍会再次拦截；应先延期留账，再单独审核新的清理范围，不能手改库来“通过”校验。
 
-- 链：`--chain-rpc`（带协议的 CometBFT RPC URL，非 gRPC、非 REST）+ `--chain-id`；工具不从 SP TOML 读链配置。
-- S3 桶：从 `--config` 的 `[PieceStore.Store]` 读（`Storage` / `BucketURL` / `IAMType`），`BUCKET_URL` 环境变量优先；云凭证走 `AWS_ACCESS_KEY`/`AWS_SECRET_KEY`（AKSK）或 SDK 默认链（SA/IRSA）。
+已完成任务禁止再次 purge。默认 verify 没有未完成任务时会提示指定历史 ID；显式查看已完成任务不会重跑检查，仅导出既有报告，重新检查必须加 `--restart`。
 
-启动时的硬校验，任一不过直接退出：① 桶未开版本控制；② 链上 bucket ID 与 `--bucket-id` 一致；③ `scan_objects` 非空。
+## 命令和数据边界
 
-领取规则：普通模式领取「进度库里没有记录」的 oid（未处理或中断未落库）；`--retry-failed` 只领 `status=2` 的失败项。`--concurrency` 个 worker 并发，各处理一个 oid。
+| 命令 | BSDB | 链 | S3 | SpDB | 工具进度库 |
+|---|---|---|---|---|---|
+| scan | 读全量存活对象 | — | — | — | 写名单、绑定、封存 |
+| task create/defer/resume | — | — | — | — | 分配任务 / 延期 / 解除暂停 |
+| purge | — | 查 bucket ID 和逐对象身份 | 列举、批删、复查 | 按 OID 删除、复查 | 读任务名单，写逐对象结果 |
+| verify | — | — | 只读检查两前缀 | 只读检查 | 保存验收代次和断点，完成任务 |
+| status | — | — | — | — | 只读汇总，不建表、不拿锁 |
 
-单个 oid 的执行顺序：
+一个 OID 对应一个 GNFD 链上 object，不是一个 S3 key。工具进度库是 `--progress-dsn` 指定的 MySQL，不是自动创建的本地 SQLite；同一个 SP 的各子任务共用该库的不同任务记录，**不需要每批一个物理子库**。
 
-1. 查链确认对象归属目标 bucket；查不到或不符 → 记失败，一条都不删。
-2. 分别列举 `s<oid>_`、`e<oid>_` 两个前缀，不按 primary/secondary 角色跳过。
-3. 每批 ≤1000 个 key 用 `DeleteObjects` 批删，校验逐 key 结果；每轮从前缀开头重列，删空为止（大对象即「列 1000 → 删 → 再列」的流式循环，不会一次性读全部 key）。
-4. 两个前缀复查为空后，按 `object_id` 删本 SP 的 `integrity_meta_NN` 与 `piece_hash`，再复查无残留。
-5. 写进度：成功 `status=1` 并累加删除量；任一步失败 `status=2` 并记原因，已删部分仍计入。
+### scan 全量导入
+
+读取本 SP BSDB 的 `objects_NN`，分表由应用层 `murmur3(bucketName) % 64` 算出，不是 MySQL 内置路由。
+筛选 `bucket_id + bucket_name + removed=0`，按源表主键分页。默认 `--batch 5000` 只是 SQL 每页行数，仍会扫完整名单。
+
+完整性要求：扫描前源表计数 = 扫描后计数 = 实际读到行数 = 进度库唯一 OID 数；检查 `rows.Err()`。
+任何一步失败不封存。中断后 scan 从头重扫、INSERT IGNORE 去重；已有快照不刷新。
+一旦 COMPLETE，禁止再 scan 追加或覆盖名单。计数不同会报错，不再只给 WARNING。
+
+计数相等不能证明源库已追上链，也不能排除扫描期间等量替换；必须先确认 BSDB 同步及目标数据冻结。
+`--count-only` 只读源表，不连接进度库，可以正常显示 0。正式扫描计数为 0 时拒绝继续，封存层也拒绝 0 行名单；请检查 bucket 名称/ID 和 BSDB 同步情况。这里检查的是对象数，不是 payload 大小，零字节对象仍可正常入库。
+
+历史空名单即使已标记 COMPLETE，status 也只给出警告，不输出 ALL_DONE。确认配置和数据源后使用新的独立进度库重新 scan，保留旧库用于排查。
+
+### task create 容量选择
+
+按 OID 升序选未分配对象，累计 `payload_size` 达到目标或数量上限即停止；默认 `500GiB`、`10000` 个 OID。
+允许最后一个普通对象略超容量。超大对象独立成批，不拆 OID；零字节对象仍占数量额度。支持正整数 `B/KiB/MiB/GiB/TiB`，不接受含糊的 `500G`。
+
+创建在事务中同时写任务、名单和 SHA-256 摘要（OID、payload、状态、版本）。写失败整体回滚；提交响应丢失后重跑返回已存在任务。
+默认排除所有已分配 OID；只有显式 `--retry-deferred` 才从已完成任务的未解决延期项重新选取，旧记录保留。
+
+### purge 删除和重试
+
+1. 启动核对环境绑定、封存状态、任务摘要、S3 版本控制状态、链上 bucket ID；Enabled/Suspended 默认拒绝，可显式放行（见下文）。
+2. 每个 OID 删前查链，核对返回 OID、bucket、状态、版本、payload 与冻结名单一致。查不到是普通失败，不退回仅信本地记录；身份不符是安全异常。
+3. 扫本 SP 配置物理桶的 `s<oid>_`、`e<oid>_`，不根据当前 primary/secondary 角色跳过。
+4. 严格校验完整 key 格式及 OID，删除入口再次校验；每轮最多 1000 个 key，用 `DeleteObjects` 批删并检查逐 key 响应。
+5. 从前缀开头重新列举剩余 key，直到两个前缀为空并复查；再按 OID 清理本地 `integrity_meta_NN`、`piece_hash` 并复查。
+6. 每个 OID 完成或失败后写进度，不是每个 piece 写一次 DB。完成写入和残留标记清除处于同一事务。
+
+2500 个 key 分为最多 1000 + 1000 + 500 三批，不是 2500 个单删请求。
+每个失败 piece 独立计数；整批请求失败则本批未成功 key 各加一次。默认 `--max-retry 10` 是首次尝试加最多 10 次重试。
+某 key 耗尽预算则停止该 OID，保留元数据；不保证该对象其他 key 全部删完。
+列举报错另计连续次数；成功列举清零。批次间按失败数退避，最多 30 秒。
+
+一个对象内部重试耗尽仍失败，就打印醒目的 `!!! STOP`（日志含 task、OID、错误原因），停止派发新对象；队列里尚未开始的对象留待下次，已开始的对象继续处理至完成或自身失败、尽量记录结果后非零退出。不再自动补跑对象、不继续遍历整批。链查询或元数据操作最终报错、进度读写失败同样停止新对象。收尾没有固定几分钟上限，大对象可能更久；自身失败仍可能留下部分残留。
+链查询的超时、连接拒绝/重置、HTTP 429/5xx 等临时错误，以及 SpDB 删除/复查的临时连接故障、死锁等，各最多 3 次应用层尝试，间隔 1 秒、2 秒。SpDB 每次尝试限时 30 秒；两张表按 OID 删除可安全重试。权限错误、对象不存在、表不存在等不盲目重试；身份/快照不符不重试。驱动内部重试不计入这 3 次。
+普通失败不写 SAFETY_HOLD：根据日志排障后重跑原 purge 命令即可，默认领取失败和未完成对象，不需要 task resume。恢复重新列实际残留，不依赖 segment 游标。dry-run 仍仅预览，不因单个对象报错提前停止。
+删除已完成但结果未落库也会停止；重跑复查后补写。统计可能漏记“删完未落库”的字节，不能用于精确账单核算。此规则仅修改 purge，verify 的逐对象验收/重试行为不变。
+
+身份不符、未知 key 或删除入口安全拒绝仍立即停止派发、取消在途任务、持久化 SAFETY_HOLD，且不自动补跑。失锁、Ctrl+C 也立即取消，不等待普通失败的收尾。
+已发出的请求无法撤回。安全暂停落库失败也会明确报错，必须人工检查后再运行。
 
 **大小对账**：每个 oid 删完（dry-run 时是列举完）后，按哪个前缀有数据推断本 SP 的角色，再和 bsdb 里的链上 `payload_size` 比对：
 
@@ -127,143 +156,82 @@ secondary 公式可逐字节复现 SP 的实际存储（本地 3+3 实测：5 Mi
 
 对不上只打 `WARNING` 并记入进度表，**不影响 DONE 判定**：字节已经删掉，拦截也不可逆。`status` 的 `size` 一行给出 checked / ok / mismatch / unchecked，并列出不符的 oid。比对以进度表里的累计 `deleted_bytes` 为准，所以中断重试后的对象也能正确比对；但中断前已删、未落库的字节无从统计，这类对象可能显示为 mismatch。另外链上参数若在对象写入后变过，历史对象也会显示为 mismatch（limewire 存续期间参数未变）。
 
-运行时日志，用于判断是否卡住：领到对象时打 `oid=X start`；每一轮批删后打一行 `oid=X s55_: round N listed=… deleted=… (prefix total keys=… bytes=…)`，大对象会连续出现多轮；每 30 秒一条总进度心跳 `progress: n/total processed, failed=…, keys=…, elapsed=…`；对象完成或失败时打 `[main|retry n/total] oid=X done|FAILED …`。失败相关日志：每个删不掉的 piece 打 `oid=X piece <key> delete failed (attempt a/b): <错误码>`（每轮最多 5 条，其余汇总成一行）；放弃时打 `giving up after N attempts`；列举报错、整批请求报错、串号 key、进度表写入失败都各有一行，写库失败以 `ERROR` 开头。主轮结束打 `main pass finished`，补跑结束打 `retry pass finished: retried/recovered/still_failed`。
 
-| 参数 | 默认 | 说明 |
+### verify 独立验收
+
+仅验收本任务全部未延期 OID，不扫描其他任务。要求对象已处理成功；有未处理/失败项须先 purge 或人工 defer。
+对每个 OID 检查两个前缀是否为空（只需至多返回一个 key），以及本地元数据是否存在；无需再次列出数千个已删 key。
+
+逐 OID 记录 PASS / RESIDUE / ERROR 与验收代次。单个查询失败默认额外重试 3 次，仍失败记录 ERROR 并继续其他对象；不会被当成空。
+进度落库失败或锁丢失立即停止。中断重跑跳过本代次 PASS，删除再次启动则旧 PASS 整批失效。
+
+报告默认 `residue-task-ID.tsv`，字段为 `oid / result / detail`（带表头、TSV 引号转义），包含当前代次残留/错误及本任务延期项。先写临时文件再原子替换，导出失败不完成任务。
+未检查的数量看 status，报告不是唯一进度依据。
+
+全部未延期对象 PASS 才完成；有延期项显示 DONE_WITH_EXCEPTIONS，不能宣称全量清空。
+verify 通过只说明配置范围内目标数据无残留，**不能证明未误删其他对象**，也不证明云端历史版本或账单已清除。
+
+### 状态和锁
+
+| 状态 | 含义 / 恢复 |
+|---|---|
+| READY | 新任务未开始 |
+| RUNNING / VERIFYING | 当前有进程持执行锁，阶段为删除 / 验收 |
+| RETRY_PENDING | 无运行进程，仍有未处理或失败 OID；重跑 purge |
+| AWAITING_VERIFY | 已处理，尚未验收完成；运行 verify |
+| VERIFY_FAILED | 有残留或查询错误；按结果重跑 purge / verify |
+| SAFETY_HOLD | 持久化安全暂停；人工查明后 resume 或合法 defer |
+| DONE | 当前代次全 PASS |
+| DONE_WITH_EXCEPTIONS | 其余对象全 PASS，但有单独留账的延期项 |
+
+RUNNING/VERIFYING 由执行锁结合阶段推导，不把崩溃前的运行标记当作永久占用。
+所有会写库的命令（含 verify、可选 dry-run 的 schema 检查）使用同一命名锁；status 不加锁。
+
+锁名包含进度库名摘要；不同 SP 的不同库不互相阻塞。通过专用 `sql.Conn` 持有 MySQL GET_LOCK，每 2 秒检查会话仍持锁，请求边界再次检查；失锁取消操作，不自动换连接重获。退出显式 RELEASE_LOCK。
+必须连接同一个 MySQL 写实例；它不是跨实例分布式锁，也不能撤回已发出的 S3 请求。不要在线复制进度库后并行清同一 SP。
+
+status 默认显示当前任务详情及总体汇总：已完成批数（含有延期项的批数）、未完成批数、未分配对象数、未解决延期数和当前锁连接；历史任务详情需传 `--task-id N`。只有 scan COMPLETE、扫描行数及名单对象数大于 0、至少一个已完成任务、无未分配/延期对象、无未完成任务且无执行锁时输出 ALL_DONE。
+全局 `purge_progress done` 只是“处理成功”，不是“验收通过”；剩余数为零也不能单独证明成功。
+
+### 任务绑定
+
+进度表只按 object_id 记录，而同一个 oid 在 7 个 SP 上都有数据。如果 sp1 误用了 sp0 的进度库，
+就会把 sp0 已完成的对象当成自己已完成而跳过。为此，进度库第一次 `scan` 时写入一行 `task_meta`，
+把这个库绑定到一个任务：
+
+| 字段 | 来源 |
+|---|---|
+| 链 ID | SP TOML `[Chain] ChainID`（为空时同 SP 一样取 `greenfield_9000-121`） |
+| SP operator 地址 | SP TOML `[SpAccount] SpOperatorAddress` |
+| 物理桶 | `BucketURL`（`BUCKET_URL` 优先）解析出的 endpoint（AWS 默认 endpoint 记为 `aws:<region>`）加桶名，path / virtual-hosted 写法视为同一个桶 |
+| SpDB | `[SpDB]` 的 `Address/Database`（环境变量优先） |
+| 目标 bucket | `--bucket`、`--bucket-id` |
+
+之后 `scan`、`purge`、`verify` 每次启动都按本次的配置和参数重新计算这些字段并与库中比对，任何一项不同都拒绝运行，
+并列出不同的字段。若确实需要更换（例如 SP 迁移了物理桶），应新建进度库重新开始，不要修改 `task_meta`。
+
+旧版本（无绑定）用过的进度库不会被自动接管：库里没有 `task_meta`、但 `scan_objects` 或 `purge_progress` 已有数据时，
+`scan` 拒绝绑定，因为无法判断这些记录属于哪个 SP，接管后其中的 DONE 会让本 SP 跳过对象。此时请换一个新的空库。
+
+
+### 核心表格式
+
+每个 SP 一套六张表，均需 InnoDB；工具自动建表，不自动创建数据库。准确 DDL 见 `internal/progress/progress.go`。
+
+| 表 | 主键 / 关键字段 | 用途 |
 |---|---|---|
-| `--config` | 必填 | SP TOML，读 `[PieceStore.Store]` 与 `[SpDB]` |
-| `--progress-dsn` | 必填 | 进度库 DSN |
-| `--bucket` / `--bucket-id` | `limewire` / `42268` | 目标桶，建议显式指定 |
-| `--chain-rpc` | `https://greenfield-chain.bnbchain.org:443` | CometBFT RPC URL，本地如 `http://127.0.0.1:26657` |
-| `--chain-id` | `greenfield_1017-1` | 与目标链匹配 |
-| `--dry-run` | `false` | 只查链 + 列举命中，不删、不写进度 |
-| `--concurrency` | `8` | 并发处理的 oid 数（不是单批 key 数） |
-| `--qps` | `50` | S3 列举/删除限速；不含链查询和 SDK 内部重试 |
-| `--max-retry` | `10` | 每个 piece 删除失败的重试上限，超过即该 oid 记 FAILED；列举报错另计，连续超过同样上限才放弃 |
-| `--retry-failed` | `false` | 只重试 `status=2` 的对象 |
-| `--data-chunks` | `0` | 大小对账用的 EC 数据分片数，0 表示从链上读 |
-| `--segment-size` | `0` | 大小对账用的最大段大小，0 表示从链上读 |
+| task_meta | id=1；chain_id、sp_operator、storage、spdb、bucket_name、bucket_id；scan_status、scan_bsdb_count、scan_rows、scan_finished_at | 固定范围及全量扫描封存 |
+| scan_objects | object_id BIGINT UNSIGNED PK；payload_size BIGINT UNSIGNED、status VARCHAR(16)、version INT | 冻结 OID 快照，status 是链对象状态 |
+| purge_tasks | id BIGINT UNSIGNED 自增 PK；target_bytes、object_count、logical_bytes；digest CHAR(64)、phase；hold_reason、hold_oid；verify_generation、done_at | 子任务范围、阶段、安全暂停、验收代次、完成时间 |
+| task_objects | 联合 PK(task_id, object_id)，object_id 索引；deferred、defer_reason、deferred_at；verify_generation、verify_status、verify_detail、verified_at | 固定成员、人工延期、逐对象验收断点 |
+| purge_progress | object_id PK；status TINYINT（1处理成功/2失败）、deleted_keys INT UNSIGNED、deleted_bytes BIGINT UNSIGNED、fail_reason、role、expected_bytes、updated_at | 每 OID 最新处理结果及累计删除量 |
+| task_events | id 自增 PK；task_id、object_id（可空）、action、reason、created_at | DEFER / RESUME 人工决定留账；不是逐 key 删除审计 |
 
-```bash
-# dry-run：先看命中多少 key，不删
-./limewire-purge purge --config ~/.local/sp0/config.toml \
-  --progress-dsn 'root:<pw>@tcp(127.0.0.1:3306)/limewire_purge_sp0' \
-  --bucket purge-test --bucket-id <ID> \
-  --chain-rpc http://127.0.0.1:26657 --chain-id greenfield_9000-121 \
-  --concurrency 1 --qps 5 --dry-run
+成员不能静默移除。延期重新分配允许同一 OID 出现在不同历史任务，但只有最后一次分配参与延期池。
+分配互斥由同库执行锁和创建事务保证；人工直接改表会破坏这些约束，不受支持。
+处理结果按 OID 累计，历史任务显示的删除统计可能随显式延期重试增加，不是逐任务尝试审计。
 
-# 正式删（去掉 --dry-run）
-./limewire-purge purge --config ~/.local/sp0/config.toml \
-  --progress-dsn 'root:<pw>@tcp(127.0.0.1:3306)/limewire_purge_sp0' \
-  --bucket purge-test --bucket-id <ID> \
-  --chain-rpc http://127.0.0.1:26657 --chain-id greenfield_9000-121 \
-  --concurrency 1 --qps 5
-
-# 只重试之前失败的
-./limewire-purge purge ... --retry-failed
-```
-
-中断后原命令重跑即续：重列前缀以实际剩余为准，不依赖 segment 游标。并发和 QPS 的示例值只是低负载起点，需按本 SP 延迟、错误率和其他租户负载调整。每个 SP 用各自的 `--config` 和独立进度库，不要多个 SP 共用一个进度库。
-
-### `verify` / `status` — 复查与汇总
-
-`verify` 忽略进度状态，对 `scan_objects` 全部 oid 重新只读列举两个前缀并检查 SpDB 元数据，把残留写到 `--out`（默认 `residue.tsv`，格式 `oid<TAB>where<TAB>count`），有残留时返回非零退出码。它不查链、不按 `--bucket` 重新过滤，检查范围由进度库和 SP 配置决定。`status` 只读进度库，打印 `done / failed / remaining` 和累计删除量，`--failures` 控制显示多少条最近失败原因。
-
-```bash
-./limewire-purge verify --config ~/.local/sp0/config.toml \
-  --progress-dsn 'root:<pw>@tcp(127.0.0.1:3306)/limewire_purge_sp0' --qps 5 --out ./residue-sp0.tsv
-
-./limewire-purge status --progress-dsn 'root:<pw>@tcp(127.0.0.1:3306)/limewire_purge_sp0' --failures 50
-```
-
-## 1. 数据从哪里读，写到哪里
-
-一个 `oid` 对应一个 Greenfield 链上 object，不是一个 S3 key；大对象可能对应数千个 key。
-逻辑 bucket 名（`--bucket`）也不是 S3 物理桶名（SP 配置中的 `BucketURL`）。
-
-| 数据源 | 配置来源 | 工具的操作 |
-|---|---|---|
-| SP 的 BSDB（block-syncer 索引库） | TOML `[BsDB]` / 环境变量 | `scan` 只读目标 bucket 的对象列表，不修改源表 |
-| 工具的进度数据库 | `--progress-dsn` | `scan` 写名单，`purge` 写完成/失败结果，`status` 读汇总 |
-| SP 的 SpDB（piece 元数据库） | TOML `[SpDB]` / 环境变量 | 物理数据清空后，删除目标 oid 的 `integrity_meta_NN` 和 `piece_hash`；`verify` 只读复查 |
-| SP 的 S3 / MinIO 物理桶 | TOML `[PieceStore.Store]` / `BUCKET_URL` | 按 oid 前缀列举、批量删除、复查 |
-| Greenfield 链 | `--chain-rpc`、`--chain-id` | `purge` 启动时核对 bucket ID；每个 oid 删除前查询对象所属 bucket |
-
-`scan` **会落库，但不是自动写入本机 SQLite**：写入的是 `--progress-dsn` 指定的 MySQL，
-它可以在本机，也可以在远端，或与 SP 数据库共用 MySQL 实例。
-
-**每个 SP、每次独立清理任务使用独立的进度库**，例如 `limewire_purge_sp0`、`limewire_purge_sp1`。
-不要将进度表建到 SP 的业务库，不要让多个 SP 共用同一进度库；当前没有 SP/任务身份绑定校验，
-误用会把其他 SP 的 DONE 当成本 SP 已完成。同一任务也不要并发启动多个 `purge` 进程。
-
-### 两张进度表
-
-| 表 | 关键字段 | 含义 |
-|---|---|---|
-| `scan_objects` | `object_id`（主键）、`payload_size`、`status`、`version` | 扫描获得的 oid 白名单；这里的 status 是链对象状态快照，如 SEALED，不是删除进度 |
-| `purge_progress` | `object_id`（主键）、`status`、`deleted_keys`、`deleted_bytes`、`fail_reason`、`updated_at` | 每个 oid 一条处理结果：`1` 完成，`2` 失败；没有记录表示未处理或中断后尚未落库 |
-
-数据库需提前创建；工具自动执行 `CREATE TABLE IF NOT EXISTS`，不会自动创建数据库。
-重跑 `scan` 使用 `INSERT IGNORE`：补入新 oid，但不覆盖已有行、不清空进度，也不刷新已有对象的字段。
-
-### 核心表结构（与当前代码一致）
-
-以下 SQL 对应 `internal/progress/progress.go` 的 `EnsureSchema()`，供检查表结构使用；
-正常运行由工具自动建表，无需手动重复执行。这两张表都位于 `--progress-dsn` 指定的数据库。
-
-#### `scan_objects`：待清理对象名单
-
-```sql
-CREATE TABLE IF NOT EXISTS scan_objects (
-    object_id    BIGINT UNSIGNED NOT NULL PRIMARY KEY,
-    payload_size BIGINT UNSIGNED NOT NULL,
-    status       VARCHAR(16) NOT NULL,
-    version      INT NOT NULL DEFAULT 0
-);
-```
-
-| 字段 | 类型 / 约束 | 含义 |
-|---|---|---|
-| `object_id` | `BIGINT UNSIGNED`，主键 | Greenfield 链上 object ID；一行一个对象，不按 piece 分行 |
-| `payload_size` | `BIGINT UNSIGNED NOT NULL` | 从 BSDB 读取的逻辑对象大小，单位 byte；不是本 SP 的物理占用量 |
-| `status` | `VARCHAR(16) NOT NULL` | BSDB 对象状态快照，写入前去掉 `OBJECT_STATUS_` 前缀，例如 `SEALED`、`CREATED`；不表示删除成功或失败 |
-| `version` | `INT NOT NULL DEFAULT 0` | BSDB 中的 Greenfield 对象版本；不是 S3 `VersionId`，删除时仍扫描整个 oid 前缀 |
-
-#### `purge_progress`：对象处理结果
-
-```sql
-CREATE TABLE IF NOT EXISTS purge_progress (
-    object_id     BIGINT UNSIGNED NOT NULL PRIMARY KEY,
-    status        TINYINT NOT NULL,
-    deleted_keys  INT UNSIGNED NOT NULL DEFAULT 0,
-    deleted_bytes BIGINT UNSIGNED NOT NULL DEFAULT 0,
-    fail_reason   TEXT NULL,
-    updated_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-                  ON UPDATE CURRENT_TIMESTAMP,
-    KEY idx_status (status)
-);
-```
-
-| 字段 | 类型 / 约束 | 含义 |
-|---|---|---|
-| `object_id` | `BIGINT UNSIGNED`，主键 | 对应 `scan_objects.object_id`，当前没有数据库外键约束 |
-| `status` | `TINYINT NOT NULL` | `1 = DONE`：物理数据与元数据复查通过；`2 = FAILED`：本次处理失败 |
-| `deleted_keys` | `INT UNSIGNED NOT NULL DEFAULT 0` | 已落库尝试中，S3 返回删除成功的 key 数之和；失败尝试中已成功删除的部分也计入 |
-| `deleted_bytes` | `BIGINT UNSIGNED NOT NULL DEFAULT 0` | 上述成功 key 在列举时的大小之和，单位 byte；中断未落库时可能少计 |
-| `fail_reason` | `TEXT NULL` | 最近一次失败原因，当前代码写入前最多保留 4000 字节；重试成功后置 NULL |
-| `updated_at` | `TIMESTAMP`，自动默认/更新 | 该进度行的数据库更新时间，不是实时运行心跳 |
-| `idx_status` | `status` 普通索引 | 用于按处理状态检索，不保证任务互斥 |
-
-两表通过 `object_id` 关联；状态选择规则如下：
-
-| 名单中存在，进度表中… | 含义 | 哪个命令会处理 |
-|---|---|---|
-| 无对应行 | 未开始，或处理中/中断后尚未写入结果；不能仅凭无行区分 | 普通 `purge` |
-| `status = 2` | 上次处理失败，可能已经删掉部分 key | `purge --retry-failed` |
-| `status = 1` | 已记录完成 | purge 跳过；`verify` 仍会复查 |
-
-当前没有 `PENDING/RUNNING` 行、批次游标、`sp_id`、`bucket_id` 或 `task_id` 字段。
-`Done/Fail` 使用 UPSERT 更新同一行并累加删除量；这些表是当前结果和累计量，不是逐次尝试的历史日志。
+旧库只有完整扫描、没有删除结果时可直接创建子任务；已有未分配到任务的旧删除结果时拒绝自动接管，使用新进度库或先单独审核迁移方案。不要通过手改 DONE/hold 字段绕过检查。
 
 ## 2. 运行前提
 
@@ -274,9 +242,18 @@ CREATE TABLE IF NOT EXISTS purge_progress (
 - 停止目标数据的上传、更新、迁移和恢复等可能重新写入 piece 的流程，确保扫描及删除期间目标集合稳定。
   不影响其他租户的读写是执行前提，需要先在测试环境验证，再低并发、小流量试运行。
 - 当前仅支持 S3 / MinIO，`PieceStore.Shards > 1` 会直接拒绝，不会遍历多个物理分片桶。
-- `purge`（含 dry-run）和 `verify` 会查询版本控制状态：Enabled、Suspended 或查询失败均拒绝继续。
-  当前不支持按 `VersionId` 清理云历史版本；不要用“暂停版本控制”绕过检查。
-- BSDB 需 SELECT 权限；SpDB 正式清理需 SELECT、DELETE；进度库需 SELECT、INSERT、UPDATE、CREATE；
+- `purge`（含 dry-run）和 `verify` 默认拒绝 Enabled/Suspended 桶；两条命令都可加 `--allow-versioned-bucket` 显式放行，并打印警告。版本控制查询失败仍拒绝，参数不能绕过权限或查询错误。
+  放行后仍按 key 删除，不按 `VersionId` 清理；verify/PASS/DONE 仅表示当前可见 key 和本地元数据通过检查，不代表历史版本、删除标记或计费空间已清除。
+
+  已确认接受上述限制时，在原命令末尾分别添加参数：
+
+  ```bash
+  ./limewire-purge purge "${purge_common[@]}" --execute --allow-versioned-bucket
+  ./limewire-purge verify "${purge_common[@]}" --allow-versioned-bucket
+  ```
+
+  示例沿用前文配置；测试环境的 purge 仍需填写对应 `--chain-id` 和 `--chain-rpc`。
+- BSDB 需 SELECT 权限；SpDB 正式清理需 SELECT、DELETE；进度库需 SELECT、INSERT、UPDATE、CREATE（旧表迁移还需 ALTER）；
   S3 需列举及查询版本控制的权限，正式清理另需删除权限。权限应限定到授权目标。
 
 ## 3. 构建
@@ -299,6 +276,12 @@ make test-logic  # 仅 pieceop / purge / spconfig，不覆盖 SDK 和真实存�
 以下仅为本地测试示意，不应覆盖正在运行的 SP 配置：
 
 ```toml
+[Chain]
+ChainID = "greenfield_9000-121"
+
+[SpAccount]
+SpOperatorAddress = "REPLACE_WITH_THIS_SP_OPERATOR"
+
 [BsDB]
 User = "bs_reader"
 Passwd = "REPLACE_ME"
@@ -333,186 +316,48 @@ IAMType = "AKSK"
 云凭证不从上述 TOML 读取。使用现有凭证注入机制，不要将真实密码或 access key 提交到仓库。
 进度 DSN 含密码，传入命令行也可能被进程列表或终端记录暴露，应使用受控运行环境。
 
-## 5. 推荐执行顺序
 
-### 5.1 准备独立进度库与参数
+## 参数速查
 
-由数据库管理员创建本 SP 的进度库并授权，例如：
-
-```sql
-CREATE DATABASE limewire_purge_sp0;
-```
-
-以下示例针对本地测试链。替换实际的 bucket ID、chain ID、配置路径及 DSN；
-正式环境不要照抄测试参数，也不要依赖命令的主网默认值。
-
-```bash
-PURGE_CONFIG='/path/to/sp0/config.toml'
-PURGE_DSN='purger:REPLACE_ME@tcp(127.0.0.1:3306)/limewire_purge_sp0'
-PURGE_BUCKET='purge-test'
-PURGE_BUCKET_ID='123'                   # 替换成链上确认过的 bucket ID
-PURGE_RPC='http://127.0.0.1:26657'       # CometBFT RPC，不是 REST 1317 或 gRPC 端口
-PURGE_CHAIN_ID='greenfield_9000-121'     # 替换成本地链的实际 chain ID
-```
-
-### 5.2 只统计，然后导入名单
-
-```bash
-# 只查 BSDB 数量；不需要进度 DSN，不创建表，不删除数据。
-./limewire-purge scan --config "$PURGE_CONFIG" \
-  --bucket "$PURGE_BUCKET" --bucket-id "$PURGE_BUCKET_ID" --count-only
-
-# 按批读取 BSDB，写入进度库 scan_objects。
-./limewire-purge scan --config "$PURGE_CONFIG" --progress-dsn "$PURGE_DSN" \
-  --bucket "$PURGE_BUCKET" --bucket-id "$PURGE_BUCKET_ID" --batch 5000
-
-./limewire-purge status --progress-dsn "$PURGE_DSN"
-```
-
-扫描读取 `objects_NN`，其中 `NN = murmur3(bucketName) % 64`，筛选 bucket ID、bucket 名及 `removed=0`，
-按源表主键分页。它不是全链枚举，也不包含已标记 removed 的对象；BSDB 必须足够新且覆盖目标范围。
-
-在目标不变的前提下，核对 BSDB 数量、本次完整读取数量、`scan_objects` 总数及已知业务清单。
-重复扫描时日志 `rows written` 是本次提交插入的行数，包含被 `INSERT IGNORE` 忽略的重复项，不等于新增行数。
-**对象数不能直接与 S3 key 数相等比较**，一个对象可能有多段、多版本或 EC 分片。
-
-### 5.3 dry-run
-
-```bash
-./limewire-purge purge --config "$PURGE_CONFIG" --progress-dsn "$PURGE_DSN" \
-  --bucket "$PURGE_BUCKET" --bucket-id "$PURGE_BUCKET_ID" \
-  --chain-rpc "$PURGE_RPC" --chain-id "$PURGE_CHAIN_ID" \
-  --concurrency 1 --qps 5 --dry-run
-```
-
-dry-run 查链并列举命中 key，不删除 S3/SpDB 数据，也不写处理结果。
-但连接进度库时仍会执行建表检查，因此不是完全无数据库写操作。
-它与普通 purge 选择相同的未处理集合，已 DONE 的对象不会重新预览；`--retry-failed --dry-run` 只预览失败项。
-dry-run 不能证明删除权限有效，也不能替代真实测试环境中的删除验证。
-
-### 5.4 正式删除
-
-完成名单、物理桶、权限和运维前提确认后，去掉 `--dry-run` 才执行删除。
-**命令没有二次确认；dry-run 默认关闭。**
-
-```bash
-./limewire-purge purge --config "$PURGE_CONFIG" --progress-dsn "$PURGE_DSN" \
-  --bucket "$PURGE_BUCKET" --bucket-id "$PURGE_BUCKET_ID" \
-  --chain-rpc "$PURGE_RPC" --chain-id "$PURGE_CHAIN_ID" \
-  --concurrency 1 --qps 5
-```
-
-上述并发和 QPS 仅为低负载起点，不是已验证的生产安全值，应根据本 SP 延迟、错误率及其他租户负载调整。
-
-每个 oid 的执行顺序：
-
-1. 查询链上对象所属 bucket；查链失败、不存在或归属不符，记录失败，不删除该 oid。
-2. 在本 SP 配置的物理桶中，分别列举 `s<oid>_`、`e<oid>_`；不依据当前 primary/secondary 角色跳过任一前缀。
-3. 校验 key 中的 oid，每批最多 1000 个 key，用 S3 `DeleteObjects` 批量删除并检查逐 key 结果。
-4. 每轮从前缀起点重新列举剩余 key；持续失败则停止该 oid，保留元数据，其他 oid 继续处理。
-5. 两个前缀再次确认为空后，按 oid 清理本 SP 的 integrity / piece_hash 元数据，并复查无残留。
-6. 写入该 oid 的完成或失败结果。
-
-小对象和大对象使用同一算法。某个前缀有 2500 个 key 时，分为最多 `1000 + 1000 + 500` 三批，
-再列举为空才结束，不会启动 2500 个并发删除。下划线保证 `s123_` 不匹配 `s1234_`；
-Greenfield 的 `_v<n>` key 后缀被同一前缀覆盖，与 S3 云版本控制不是一回事。
-
-### 5.5 中断恢复与失败重试
-
-单个 oid 内部先自愈，重试**按 piece 计数**：
-
-- 每轮从前缀起点重新列举，列出来的正好只剩没删成功的 key，一起再删一次。
-- 每个 key 各自记失败次数；别的 key 删成功不会清零它的次数。整个删除请求报错时，这批没删掉的 key 各记一次。
-- 某个 key 累计失败超过 `--max-retry`（默认 10，即最多尝试 11 次）时，该 oid 记为 `status=2`；此时其他能删的 piece 都已删完，卡住的留在桶里。
-- 列举报错单独计数，连续超过 `--max-retry` 次才放弃，列举成功一次即清零。
-- 两轮之间按失败次数指数退避，上限 30 秒。中途失败只打日志、不写进度表。放弃后保留该 oid 的元数据，继续处理其他 oid。
-
-主轮跑完后，工具**自动把本次失败的 oid 再补跑一遍**，每个 piece 的计数从零开始。补跑仍失败的保持 `status=2`，日志逐个列出 `still FAILED oid=…`。之前运行遗留的失败项不在自动补跑范围内，要用 `--retry-failed`。跨命令的重试如下：
-
-- 原参数重跑普通 `purge`：仅处理没有进度记录的 oid，跳过已完成和已记录失败项。
-- `purge --retry-failed`：仅重试 `status=2` 的失败项，不会顺带处理未处理项。
-- 中断可能留下未落库项，也可能留下已记录失败项；恢复时需要检查这两类，必要时分别运行。
-- 重启后重新列举实际剩余 key，不依赖 segment 游标；已删除部分不必恢复后再删。
-- `scan` 中断后可重跑补名单，但不会从持久化的源表游标继续，而是重新扫描并忽略重复 oid。
-
-```bash
-./limewire-purge purge --config "$PURGE_CONFIG" --progress-dsn "$PURGE_DSN" \
-  --bucket "$PURGE_BUCKET" --bucket-id "$PURGE_BUCKET_ID" \
-  --chain-rpc "$PURGE_RPC" --chain-id "$PURGE_CHAIN_ID" \
-  --concurrency 1 --qps 5 --retry-failed
-```
-
-### 5.6 独立复查
-
-```bash
-./limewire-purge verify --config "$PURGE_CONFIG" --progress-dsn "$PURGE_DSN" \
-  --qps 5 --out ./residue-sp0.tsv
-
-./limewire-purge status --progress-dsn "$PURGE_DSN" --failures 50
-```
-
-`verify` 忽略 DONE/FAILED 状态，对 `scan_objects` 全部 oid 重新列举两个前缀，并检查 SpDB 元数据。
-不删除业务数据，不修改完成状态，但仍会做进度表建表检查，并创建或覆盖 `--out` 文件。
-它不查询链，也不使用 `--bucket` / `--bucket-id` 重新过滤名单；检查范围由进度库和 SP 配置决定。
-
-残留报告无表头，格式为 `oid<TAB>where<TAB>count`，例如：
-
-```text
-123	s123_	5
-456	metadata	1
-```
-
-`metadata=1` 表示存在元数据，不是精确行数；日志 `residue` 是残留条目数，不是残留对象数。
-发现残留时 verify 返回非零退出码。
-
-验收需同时确认：名单完整；`done=total`、`failed=0`；verify 的 `checked=total`、`residue=0`；
-日志没有查链、存储或进度落库错误。每个 SP 分别验收，单个 SP 成功不代表全部副本已清理。
-
-## 6. 参数速查
-
-| 参数 | 命令 | 默认值 / 说明 |
+| 参数 | 命令 | 默认 / 说明 |
 |---|---|---|
-| `--config` | scan / purge / verify | 必填 SP TOML 路径 |
-| `--progress-dsn` | 除 count-only 外 | 必填独立 MySQL 进度库 DSN；status 不需要 config |
-| `--bucket` | scan / purge | `limewire`，建议显式指定 |
-| `--bucket-id` | scan / purge | `42268`，十进制，建议显式指定 |
-| `--batch` | scan | `5000`，每次源库查询的行数，使用正整数；不是 S3 删除批大小 |
-| `--count-only` | scan | `false`，只打印源库计数 |
-| `--chain-rpc` | purge | `https://greenfield-chain.bnbchain.org:443`；使用带协议的 CometBFT RPC URL |
-| `--chain-id` | purge | `greenfield_1017-1`；与目标链匹配，工具不从 SP TOML 读取链配置 |
-| `--dry-run` | purge | `false`；只预览所选集合 |
-| `--concurrency` | purge | `8`，同时处理的 oid 数，不是单批 key 数 |
-| `--qps` | purge / verify | `50`，存储列举/删除路径的限速参数；不是链查询/MySQL 的统一限速，也不含 SDK 内部重试的精确请求计数 |
-| `--max-retry` | purge | `10`，每个 piece 删除失败的重试上限（整批请求报错时这批 key 各记一次）；列举报错另计连续次数；主轮结束后本次失败的 oid 自动补跑一遍 |
-| `--retry-failed` | purge | `false`；开启后只选失败项 |
-| `--out` | verify | `./residue.tsv`，会覆盖同名文件 |
-| `--failures` | status | `20`，显示最近失败原因的条数 |
+| --config | scan/task/purge/verify | 本 SP TOML；status 可省略，提供时核对绑定 |
+| --progress-dsn | 除 scan --count-only 外 | 独立 MySQL 库，必须带库名 |
+| --bucket / --bucket-id | 有 config 的命令 | limewire / 42268；建议显式填写 |
+| --batch | scan | 5000，SQL 页大小 |
+| --target-size / --max-objects | task create | 500GiB / 10000，最大对象数允许 1..100000 |
+| --retry-deferred | task create | 默认关闭；显式处理延期池 |
+| --task-id | purge/verify/status/task defer/task resume | 默认当前任务；purge/defer/resume 传值必须匹配当前 ID；verify/status 可显式查历史 |
+| --oid / --reason | task defer | 必填；reason 为人工原因 |
+| --reason | task resume | 必填；不会修改冻结快照 |
+| --execute / --dry-run | purge | 二选一；真实删除必须 execute |
+| --allow-versioned-bucket | purge / verify | 默认 false；显式放行 Enabled/Suspended，历史版本和删除标记不在清理及验收范围内 |
+| --chain-rpc / --chain-id | purge | 主网 RPC / greenfield_1017-1；测试环境务必改 |
+| --concurrency / --qps | purge | 8 / 50；按其他租户负载调整，QPS 不含 SDK 内部重试 |
+| --max-retry | purge / verify | 10 / 3，额外重试数 |
+| --chain-timeout / --s3-timeout | purge | 30s / 2m；verify 同样有 s3-timeout |
+| --data-chunks / --segment-size | purge | 0：从链读，仅用于大小对账 |
+| --restart | verify | 默认 false；新验收代次，全部重新检查 |
+| --out | verify | residue-task-ID.tsv，原子覆盖 |
+| --failures | status | 20，显示失败及各任务报告样本条数 |
 
-`status` 中 `remaining = total - done - failed`，表示尚无结果的对象数；
-**remaining=0 不等于全部成功**，还要检查 failed。`deleted_keys/bytes` 累加已落库尝试的删除结果，
-中断前未落库的删除量可能漏计，不是精确账单节省值。`scan Σ payload_size` 是逻辑对象大小，
-不能直接当作本 SP 应释放的物理字节数。
+## 限制和测试
 
-## 7. 当前限制与实现边界
+- 不自动连续跨子任务；不做逐 key 审计或云端日志对账。
+- 不支持物理分片桶和云历史版本永久清理；使用 --allow-versioned-bucket 不改变这一限制。
+- verify 仅覆盖导入名单和当前配置物理桶，不代表链上已删除、停止计费或全部 SP 副本都消失。
+- 冻结目标数据是断点验收有效的前提；有回写可能时必须先停回写，再 --restart 完整复验。
+- 大小对账不是防误删证明，现有失败记录可能缺少角色/期望量，统计也可能因中断少计。
+- 使用官方 Greenfield 链客户端、AWS SDK；保留独立的受限批删及按 OID 清元数据，不直接调用 SP 完整 GC。
 
-以下是当前实现的限制，不是已经具备的安全保障：
+单元测试覆盖容量分配、状态、会话锁互斥/失锁、piece 重试、安全停机、验收断点/代次及错误恢复。MySQL 真实生命周期测试为显式选用：
 
-- 扫描尚无完成标记，且源库迭代尚缺 `rows.Err()` 检查；中途读取失败可能被当作扫描结束。
-  正式执行前应修复，不能仅凭存在 `scan_objects` 或 `scan done` 日志认定名单完整。
-- purge 的对象失败或进度写入失败尚未统一转为非零退出码，完成日志也可能先于落库。
-  不能仅凭退出码 0、`finished` 或 `done` 日志验收。
-- 进度库尚无 SP/链/bucket/物理存储身份绑定，也无跨进程任务锁；必须隔离数据库并避免并发运行。
-- verify 仅验证已导入名单；漏扫的 oid 不在检查范围内，空名单也不能证明目标桶已清空。
+```bash
+# 管理员准备一个全新的空测试库，名字必须以 limewire_purge_test_ 开头。
+# 只向该库写测试表/数据，不连链、S3、BSDB、SpDB；运行后保留数据供检查。
+LIMEWIRE_TEST_MYSQL_DSN='user:password@tcp(test-host:3306)/limewire_purge_test_001' \
+  go test ./internal/progress -run TestMySQLSubtaskLifecycle -v
+```
 
-工具复用官方 Greenfield Go SDK 查询链，使用 AWS SDK 执行物理批删；不直接复用 SP 的完整 GC 流程。
-目前有意保留独立实现的两处是：SP `DeleteObjectsByPrefix` 的循环批次累积及错误处理，
-以及 `DeleteObjectIntegrity(math.MaxInt32)` 分支。这里分别使用新批次逐 key 检查，
-和明确的 `WHERE object_id=?` 清理所有 redundancy index，避免把旧行为带入一次性清理工具。
-
-## 8. 相关文档
-
-- [本地测试步骤](TESTING.md)：需结合本 README 的独立进度库、命令参数和限制说明；对象数量不等于 piece 数量。
-- 工作区配套方案：`../report/limewire-s3-purge-plan.html`。
-- 工作区配套操作说明：`../report/limewire-purge-runbook.html`。
-
-后两份文件在父工作区，不随单独 clone 本仓库提供。运行行为以当前代码及本 README 为准。
+没有测试 DSN 时该项 SKIP。上线前还需真实 MySQL、测试链和对象存储联调，不能用离线测试代替。
+详见 [子任务设计](docs/SUBTASK_DESIGN.md)、[本地测试](docs/LOCAL_TEST.md)。工作区配套方案在父目录 report，不随单独 clone 提供。

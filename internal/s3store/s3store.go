@@ -8,13 +8,16 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
+	"limewire-purge/internal/pieceop"
 	"limewire-purge/internal/spconfig"
 )
 
@@ -39,12 +42,20 @@ type Store struct {
 // New builds a client from the SP's BucketURL / IAMType.
 //   - IAMType=SA : nothing to do, the SDK picks up AWS_ROLE_ARN + AWS_WEB_IDENTITY_TOKEN_FILE (IRSA).
 //   - IAMType=AKSK: the SP uses AWS_ACCESS_KEY / AWS_SECRET_KEY / AWS_SESSION_TOKEN; map them.
-func New(ctx context.Context, ps spconfig.ObjectStorage) (*Store, error) {
+//
+// timeout bounds each HTTP attempt end to end, response body included. The SDK's
+// default HTTP client only bounds dialing and the TLS handshake, so a stalled
+// response would otherwise hang forever and its retryer would never get a turn;
+// with the timeout, a stalled attempt fails as a timeout and the SDK retries it.
+func New(ctx context.Context, ps spconfig.ObjectStorage, timeout time.Duration) (*Store, error) {
 	t, err := spconfig.ParseBucketURL(ps.BucketURL)
 	if err != nil {
 		return nil, fmt.Errorf("BucketURL: %w", err)
 	}
-	opts := []func(*awsconfig.LoadOptions) error{awsconfig.WithRegion(t.Region)}
+	opts := []func(*awsconfig.LoadOptions) error{
+		awsconfig.WithRegion(t.Region),
+		awsconfig.WithHTTPClient(awshttp.NewBuildableClient().WithTimeout(timeout)),
+	}
 	if ps.IAMType == "AKSK" || ps.IAMType == "" {
 		ak, sk, tok := os.Getenv("AWS_ACCESS_KEY"), os.Getenv("AWS_SECRET_KEY"), os.Getenv("AWS_SESSION_TOKEN")
 		if ak != "" && sk != "" {
@@ -138,14 +149,33 @@ func (s *Store) EnsureVersioningDisabled(ctx context.Context, allowVersioned boo
 	return nil
 }
 
-// Delete removes one batch (<=1000 keys). It returns what S3 confirmed deleted and
-// what it refused; a non-nil error means the request itself failed.
-func (s *Store) Delete(ctx context.Context, keys []string) (deleted []string, failed []KeyError, err error) {
+// ErrUnsafeKeys is returned, with no request sent, when a delete batch holds a key
+// that is not a well-formed piece of the object being deleted. It is a
+// correctness violation, never a transient error.
+var ErrUnsafeKeys = errors.New("refusing to delete keys that are not well-formed pieces of the object")
+
+// CheckKeys enforces that every key is a well-formed piece key of object oid.
+func CheckKeys(oid uint64, keys []string) error {
+	if _, rejected := pieceop.KeepOnly(keys, oid); len(rejected) > 0 {
+		return fmt.Errorf("%w %d: %d keys, e.g. %q", ErrUnsafeKeys, oid, len(rejected), rejected[0])
+	}
+	return nil
+}
+
+// Delete removes one batch (<=1000 keys) of object oid's pieces. It is the only
+// delete entry point and validates every key itself (CheckKeys), so no caller can
+// delete anything but well-formed pieces of the named object. It returns what S3
+// confirmed deleted and what it refused; a non-nil error means the request itself
+// failed or was refused.
+func (s *Store) Delete(ctx context.Context, oid uint64, keys []string) (deleted []string, failed []KeyError, err error) {
 	if len(keys) == 0 {
 		return nil, nil, nil
 	}
 	if len(keys) > 1000 {
 		return nil, nil, errors.New("batch larger than 1000 keys")
+	}
+	if err := CheckKeys(oid, keys); err != nil {
+		return nil, nil, err
 	}
 	ids := make([]types.ObjectIdentifier, 0, len(keys))
 	for _, k := range keys {

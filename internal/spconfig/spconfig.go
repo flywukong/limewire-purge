@@ -31,11 +31,25 @@ type PieceStore struct {
 	Store  ObjectStorage
 }
 
+type Chain struct {
+	ChainID string
+}
+
+type SpAccount struct {
+	SpOperatorAddress string
+}
+
 type Config struct {
 	SpDB       SQLDB
 	BsDB       SQLDB
 	PieceStore PieceStore
+	Chain      Chain
+	SpAccount  SpAccount
 }
+
+// defaultChainID is what the SP itself falls back to when [Chain] ChainID is
+// empty (base/gfspapp DefaultChainID, applied in cmd/utils MakeGnfd).
+const defaultChainID = "greenfield_9000-121"
 
 // Load parses the SP TOML and applies the same env overrides the SP daemon honours.
 func Load(path string) (*Config, error) {
@@ -50,6 +64,9 @@ func Load(path string) (*Config, error) {
 	// otherwise the tool could target the stale TOML bucket while the SP writes elsewhere.
 	if v, ok := os.LookupEnv("BUCKET_URL"); ok {
 		c.PieceStore.Store.BucketURL = v
+	}
+	if c.Chain.ChainID == "" {
+		c.Chain.ChainID = defaultChainID
 	}
 	if c.PieceStore.Shards > 1 {
 		return nil, fmt.Errorf("PieceStore.Shards=%d: sharded piece stores are not supported by this tool", c.PieceStore.Shards)
@@ -90,6 +107,16 @@ type S3Target struct {
 	Endpoint  string // empty = AWS default endpoint for Region
 	PathStyle bool
 	UseSSL    bool
+}
+
+// Identity names the physical bucket regardless of URL style: the endpoint (or
+// the AWS region when the default AWS endpoint is used) plus the bucket name.
+func (t S3Target) Identity() string {
+	where := t.Endpoint
+	if where == "" {
+		where = "aws:" + t.Region
+	}
+	return where + "/" + t.Bucket
 }
 
 // ParseBucketURL mirrors store/piecestore/storage/s3.go parseS3Endpoint + parseS3Region.

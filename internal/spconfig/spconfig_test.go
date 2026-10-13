@@ -108,6 +108,38 @@ func TestLoadAcceptsMinio(t *testing.T) {
 	}
 }
 
+func TestLoadChainAndOperator(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "sp.toml")
+	os.WriteFile(p, []byte("[Chain]\nChainID = \"greenfield_1017-1\"\n[SpAccount]\nSpOperatorAddress = \"0xABCD\"\n"), 0o600)
+	c, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Chain.ChainID != "greenfield_1017-1" || c.SpAccount.SpOperatorAddress != "0xABCD" {
+		t.Fatalf("got %+v %+v", c.Chain, c.SpAccount)
+	}
+
+	// empty ChainID falls back to the SP's own default
+	os.WriteFile(p, []byte("[SpAccount]\nSpOperatorAddress = \"0xABCD\"\n"), 0o600)
+	if c, err = Load(p); err != nil || c.Chain.ChainID != "greenfield_9000-121" {
+		t.Fatalf("default chain id: %+v %v", c.Chain, err)
+	}
+}
+
+// The same physical bucket must get the same identity whatever URL style names it.
+func TestS3TargetIdentity(t *testing.T) {
+	path, _ := ParseBucketURL("https://s3.us-east-1.amazonaws.com/b1")
+	vhost, _ := ParseBucketURL("https://b1.s3.us-east-1.amazonaws.com")
+	if path.Identity() != "aws:us-east-1/b1" || vhost.Identity() != path.Identity() {
+		t.Fatalf("path=%s vhost=%s", path.Identity(), vhost.Identity())
+	}
+	minio, _ := ParseBucketURL("http://127.0.0.1:9000/sp0")
+	if minio.Identity() != "http://127.0.0.1:9000/sp0" {
+		t.Fatalf("minio=%s", minio.Identity())
+	}
+}
+
 func TestLoadRejectsSharded(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "sp.toml")

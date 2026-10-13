@@ -2,26 +2,26 @@
 // SP's physical object storage without touching chain state.
 //
 //	scan    pull the bucket's object ids out of the SP's bsdb into scan_objects
-//	purge   process every unprocessed object (chain check → prefix delete → metadata)
-//	verify  ignore progress, re-scan everything read-only, report residue
+//	task    allocate capacity-bounded subtasks; explicitly defer/resume
+//	purge   process the selected subtask (chain check → prefix delete → metadata)
+//	verify  independently check the subtask, persist verification checkpoints
 //	status  print counts
 package main
 
 import (
-	"bufio"
 	"context"
+	"database/sql"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
-
-	"golang.org/x/time/rate"
+	"time"
 
 	"limewire-purge/internal/bsdb"
 	"limewire-purge/internal/chain"
-	"limewire-purge/internal/pieceop"
 	"limewire-purge/internal/progress"
 	"limewire-purge/internal/purge"
 	"limewire-purge/internal/s3store"
@@ -47,8 +47,13 @@ func main() {
 		err = runVerify(ctx, os.Args[2:])
 	case "status":
 		err = runStatus(ctx, os.Args[2:])
+	case "task":
+		err = runTask(ctx, os.Args[2:])
 	default:
 		usage()
+	}
+	if errors.Is(err, flag.ErrHelp) {
+		return
 	}
 	if err != nil {
 		log.Fatalf("%s: %v", os.Args[1], err)
@@ -56,7 +61,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: limewire-purge <scan|purge|verify|status> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: limewire-purge <scan|task|purge|verify|status> [flags]")
 	os.Exit(2)
 }
 
@@ -76,22 +81,83 @@ func (c *common) open(ctx context.Context) (*progress.DB, error) {
 	if c.progressDSN == "" {
 		return nil, fmt.Errorf("--progress-dsn is required")
 	}
-	pg, err := progress.Open(c.progressDSN)
+	return progress.Open(c.progressDSN)
+}
+
+func (c *common) openLocked(ctx context.Context, operation string) (*progress.DB, context.Context, error) {
+	pg, err := c.open(ctx)
 	if err != nil {
-		return nil, err
+		return nil, ctx, err
 	}
-	return pg, pg.EnsureSchema(ctx)
+	l, err := pg.Acquire(ctx, operation)
+	if err != nil {
+		pg.Close()
+		return nil, ctx, err
+	}
+	ctx = l.Context()
+	if err := pg.EnsureSchema(ctx); err != nil {
+		pg.Close()
+		return nil, ctx, err
+	}
+	return pg, ctx, nil
+}
+
+// binding is the task identity this run works for, taken from the SP config and
+// the bucket flags; the progress database must be bound to exactly this.
+func (c *common) binding(cfg *spconfig.Config) (progress.Binding, error) {
+	if cfg.SpAccount.SpOperatorAddress == "" {
+		return progress.Binding{}, fmt.Errorf("%s: [SpAccount] SpOperatorAddress is empty", c.config)
+	}
+	t, err := spconfig.ParseBucketURL(cfg.PieceStore.Store.BucketURL)
+	if err != nil {
+		return progress.Binding{}, fmt.Errorf("BucketURL: %w", err)
+	}
+	return progress.Binding{
+		ChainID:    cfg.Chain.ChainID,
+		SPOperator: cfg.SpAccount.SpOperatorAddress,
+		Storage:    t.Identity(),
+		SpDB:       cfg.SpDB.Address + "/" + cfg.SpDB.Database,
+		Bucket:     c.bucket,
+		BucketID:   c.bucketID,
+	}, nil
+}
+
+// openBound opens the progress database for purge/verify: it must belong to this
+// task and hold a list from a scan that completed.
+func (c *common) openBound(ctx context.Context, cfg *spconfig.Config) (*progress.DB, context.Context, error) {
+	b, err := c.binding(cfg)
+	if err != nil {
+		return nil, ctx, err
+	}
+	pg, ctx, err := c.openLocked(ctx, "task operation")
+	if err != nil {
+		return nil, ctx, err
+	}
+	if err := pg.CheckBinding(ctx, b); err != nil {
+		pg.Close()
+		return nil, ctx, err
+	}
+	if err := pg.RequireCompleteScan(ctx); err != nil {
+		pg.Close()
+		return nil, ctx, err
+	}
+	return pg, ctx, nil
 }
 
 // ---------------------------------------------------------------- scan
 
 func runScan(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("scan", flag.ExitOnError)
+	fs := flag.NewFlagSet("scan", flag.ContinueOnError)
 	var c common
 	addCommon(fs, &c)
 	batch := fs.Int("batch", 5000, "rows per bsdb query")
 	countOnly := fs.Bool("count-only", false, "only print COUNT(*) from bsdb, write nothing")
-	fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("unexpected arguments: %v", fs.Args())
+	}
 
 	cfg, err := spconfig.Load(c.config)
 	if err != nil {
@@ -112,12 +178,28 @@ func runScan(ctx context.Context, args []string) error {
 	if *countOnly {
 		return nil
 	}
+	if n == 0 {
+		return progress.ErrEmptyScan
+	}
 
-	pg, err := c.open(ctx)
+	b, err := c.binding(cfg)
+	if err != nil {
+		return err
+	}
+	pg, ctx, err := c.openLocked(ctx, "scan")
 	if err != nil {
 		return err
 	}
 	defer pg.Close()
+	if err := pg.Bind(ctx, b); err != nil {
+		return err
+	}
+	log.Printf("progress database bound to chain %s, SP %s, storage %s, SpDB %s, bucket %s (id %d)",
+		b.ChainID, b.SPOperator, b.Storage, b.SpDB, b.Bucket, b.BucketID)
+	// purge and verify refuse the list from here until this scan reconciles
+	if err := pg.BeginScan(ctx, n); err != nil {
+		return err
+	}
 
 	var written uint64
 	total, err := sc.Scan(ctx, c.bucketID, c.bucket, *batch, func(rows []progress.ScanRow) error {
@@ -129,13 +211,23 @@ func runScan(ctx context.Context, args []string) error {
 		return nil
 	})
 	if err != nil {
+		return fmt.Errorf("%w; the list is marked incomplete, re-run scan", err)
+	}
+	after, err := sc.Count(ctx, c.bucketID, c.bucket)
+	if err != nil {
+		return fmt.Errorf("recount after scan: %w; the list is marked incomplete, re-run scan", err)
+	}
+	if err := bsdb.Reconcile(n, after, total); err != nil {
+		return err
+	}
+	if err := pg.FinishScan(ctx, total); err != nil {
 		return err
 	}
 	cnt, err := pg.Counts(ctx)
 	if err != nil {
 		return err
 	}
-	log.Printf("scan done: %d rows read from bsdb, scan_objects now holds %d objects / %d bytes", total, cnt.Total, cnt.ScanBytes)
+	log.Printf("scan complete: %d rows read from bsdb = %d live objects; scan_objects holds %d objects / %d bytes", total, n, cnt.Total, cnt.ScanBytes)
 	return nil
 }
 
@@ -143,25 +235,31 @@ func runScan(ctx context.Context, args []string) error {
 
 type chainAdapter struct{ c *chain.Client }
 
-func (a chainAdapter) HeadObjectBucket(ctx context.Context, oid uint64) (string, error) {
+func (a chainAdapter) HeadObject(ctx context.Context, oid uint64) (purge.ObjectHead, error) {
 	h, err := a.c.HeadObjectByID(ctx, oid)
 	if err != nil {
-		return "", err
+		return purge.ObjectHead{}, err
 	}
-	return h.BucketName, nil
+	return purge.ObjectHead{ID: h.ID, Bucket: h.BucketName, Status: h.Status, Version: h.Version, PayloadSize: h.PayloadSize}, nil
 }
 
 // progressAdapter maps the purge package's Progress interface onto the progress DB.
-type progressAdapter struct{ db *progress.DB }
+type progressAdapter struct {
+	db     *progress.DB
+	taskID uint64
+}
 
 func (a progressAdapter) Claim(ctx context.Context, after uint64, limit int, retryFailed bool) ([]purge.Claimed, error) {
-	rows, err := a.db.Claim(ctx, after, limit, retryFailed)
+	if err := a.db.CheckLock(ctx); err != nil {
+		return nil, err
+	}
+	rows, err := a.db.ClaimSubtask(ctx, a.taskID, after, limit)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]purge.Claimed, len(rows))
 	for i, r := range rows {
-		out[i] = purge.Claimed{OID: r.ObjectID, PayloadSize: r.PayloadSize}
+		out[i] = purge.Claimed{OID: r.ObjectID, PayloadSize: r.PayloadSize, Status: r.Status, Version: r.Version}
 	}
 	return out, nil
 }
@@ -172,34 +270,76 @@ func (a progressAdapter) Done(ctx context.Context, oid uint64, keys, bytes uint6
 		e := check.Expected
 		expected = &e
 	}
-	return a.db.Done(ctx, oid, keys, bytes, check.Role, expected)
+	return a.db.DoneSubtask(ctx, a.taskID, oid, keys, bytes, check.Role, expected)
 }
 
 func (a progressAdapter) Fail(ctx context.Context, oid uint64, keys, bytes uint64, reason string) error {
+	if err := a.db.CheckMember(ctx, a.taskID, oid); err != nil {
+		return err
+	}
 	return a.db.Fail(ctx, oid, keys, bytes, reason)
 }
 
-func runPurge(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("purge", flag.ExitOnError)
+func runPurge(ctx context.Context, args []string) (retErr error) {
+	fs := flag.NewFlagSet("purge", flag.ContinueOnError)
 	var c common
 	addCommon(fs, &c)
+	taskID := fs.Uint64("task-id", 0, "optional expectation: must match the current unfinished task")
+	execute := fs.Bool("execute", false, "confirm real deletion within the selected task")
 	chainRPC := fs.String("chain-rpc", "https://greenfield-chain.bnbchain.org:443", "chain CometBFT RPC URL (with scheme); local e.g. http://localhost:26657")
 	chainID := fs.String("chain-id", "greenfield_1017-1", "chain id, e.g. greenfield_1017-1 (mainnet) or greenfield_9000-121 (local)")
 	dryRun := fs.Bool("dry-run", false, "list only; delete nothing; write no progress")
 	conc := fs.Int("concurrency", 8, "objects processed in parallel")
 	qps := fs.Float64("qps", 50, "object-storage requests per second (list + delete)")
-	maxRetry := fs.Int("max-retry", 10, "retries per piece before an object is marked failed (list errors are counted separately); failed objects are re-run once after the main pass")
-	retryFailed := fs.Bool("retry-failed", false, "re-process objects previously marked failed")
-	allowVersioned := fs.Bool("allow-versioned-bucket", false, "proceed even if the bucket has versioning Enabled/Suspended; deletes by key only, so historical versions are not removed and delete markers are left behind — test buckets only")
+	maxRetry := fs.Int("max-retry", 10, "retries per piece (list errors counted separately); an object still failing stops this run, fix the cause and rerun")
+	retryFailed := fs.Bool("retry-failed", false, "deprecated: current-task failed objects are now included automatically")
+	allowVersioned := fs.Bool("allow-versioned-bucket", false, "explicitly allow Enabled/Suspended buckets; deletes current keys only, leaving historical versions and delete markers outside verification")
 	dataChunks := fs.Uint("data-chunks", 0, "EC data chunks for the secondary size check; 0 = read current value from chain")
 	segmentSize := fs.Uint64("segment-size", 0, "max segment size for the secondary size check; 0 = read current value from chain")
-	fs.Parse(args)
+	chainTimeout := fs.Duration("chain-timeout", 30*time.Second, "HTTP timeout of one chain query; transient network errors and HTTP 429/5xx are tried up to 3 times")
+	s3Timeout := fs.Duration("s3-timeout", 2*time.Minute, "timeout of one object-storage HTTP attempt, response body included; the AWS SDK retries a timed-out attempt")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("unexpected arguments: %v", fs.Args())
+	}
+	if !*execute && !*dryRun {
+		return fmt.Errorf("real deletion requires --execute; optional --dry-run previews only")
+	}
+	if *execute && *dryRun {
+		return fmt.Errorf("choose --execute or --dry-run, not both")
+	}
+	if *conc <= 0 || *qps <= 0 || *maxRetry < 0 || *chainTimeout <= 0 || *s3Timeout <= 0 {
+		return fmt.Errorf("invalid concurrency/QPS/retry/timeout")
+	}
 
 	cfg, err := spconfig.Load(c.config)
 	if err != nil {
 		return err
 	}
-	store, err := s3store.New(ctx, cfg.PieceStore.Store)
+	if *chainID != cfg.Chain.ChainID {
+		return fmt.Errorf("--chain-id %s does not match the SP config's chain %s; refusing to run", *chainID, cfg.Chain.ChainID)
+	}
+	pg, ctx, err := c.openBound(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer pg.Close()
+	task, err := pg.ResolveCurrentSubtask(ctx, *taskID)
+	if err != nil {
+		return err
+	}
+	defer beginTaskLog("purge", task)()
+	defer func() { retErr = withTaskError(task.ID, retErr) }()
+	if task.DoneAt.Valid || task.HoldReason != "" {
+		return fmt.Errorf("task %d is completed or on SAFETY_HOLD: %s", task.ID, task.HoldReason)
+	}
+	if err := pg.CheckManifest(ctx, task); err != nil {
+		return holdGlobal(ctx, pg, task, err)
+	}
+
+	store, err := s3store.New(ctx, cfg.PieceStore.Store, *s3Timeout)
 	if err != nil {
 		return err
 	}
@@ -208,7 +348,7 @@ func runPurge(ctx context.Context, args []string) error {
 		return err
 	}
 
-	ch, err := chain.New(*chainID, *chainRPC)
+	ch, err := chain.New(*chainID, *chainRPC, *chainTimeout)
 	if err != nil {
 		return err
 	}
@@ -217,7 +357,7 @@ func runPurge(ctx context.Context, args []string) error {
 		return err
 	}
 	if id != c.bucketID {
-		return fmt.Errorf("chain says bucket %s has id %d, flag --bucket-id is %d; refusing to run", c.bucket, id, c.bucketID)
+		return holdGlobal(ctx, pg, task, fmt.Errorf("chain says bucket %s has id %d, flag --bucket-id is %d; refusing to run", c.bucket, id, c.bucketID))
 	}
 
 	// EC layout for the size check. The chain value is the *current* one; objects
@@ -225,7 +365,7 @@ func runPurge(ctx context.Context, args []string) error {
 	// a warning only. limewire's params never changed during its lifetime.
 	dc, seg := uint32(*dataChunks), *segmentSize
 	if dc == 0 || seg == 0 {
-		cdc, cseg, perr := ch.RedundancyParams()
+		cdc, cseg, perr := ch.RedundancyParams(ctx)
 		if perr != nil {
 			log.Printf("WARNING: cannot read EC params from chain (%v); secondary size check disabled unless --data-chunks/--segment-size are given", perr)
 		}
@@ -244,128 +384,95 @@ func runPurge(ctx context.Context, args []string) error {
 	}
 	defer meta.Close()
 
-	pg, err := c.open(ctx)
-	if err != nil {
-		return err
-	}
-	defer pg.Close()
-	cnt, err := pg.Counts(ctx)
+	cnt, err := pg.SubCounts(ctx, task.ID)
 	if err != nil {
 		return err
 	}
 	if cnt.Total == 0 {
 		return fmt.Errorf("scan_objects is empty; run scan first")
 	}
-	log.Printf("progress: total=%d done=%d failed=%d remaining=%d (dry-run=%v retry-failed=%v)",
-		cnt.Total, cnt.Done, cnt.Failed, cnt.Remaining(), *dryRun, *retryFailed)
-
-	r := &purge.Runner{
-		Store: store, Chain: chainAdapter{ch}, Meta: meta, Progress: progressAdapter{pg},
-		Opt: purge.Options{Bucket: c.bucket, Concurrency: *conc, QPS: *qps, MaxRetry: *maxRetry, DryRun: *dryRun, RetryFailed: *retryFailed,
-			DataChunks: dc, SegmentSize: seg},
+	log.Printf("task=%d total=%d processed=%d failed=%d pending=%d deferred=%d (dry-run=%v)",
+		task.ID, cnt.Total, cnt.Processed, cnt.Failed, cnt.Pending, cnt.Deferred, *dryRun)
+	if *retryFailed {
+		log.Print("--retry-failed is no longer required: this task automatically includes failed objects")
 	}
-	return r.Run(ctx, cnt.Total)
-}
-
-// ---------------------------------------------------------------- verify
-
-func runVerify(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("verify", flag.ExitOnError)
-	var c common
-	addCommon(fs, &c)
-	out := fs.String("out", "./residue.tsv", "residue report (oid<TAB>where<TAB>count)")
-	qps := fs.Float64("qps", 50, "object-storage requests per second")
-	allowVersioned := fs.Bool("allow-versioned-bucket", false, "proceed even if the bucket has versioning Enabled/Suspended; a clean report then does not prove the prefix is truly empty")
-	fs.Parse(args)
-
-	cfg, err := spconfig.Load(c.config)
-	if err != nil {
-		return err
-	}
-	store, err := s3store.New(ctx, cfg.PieceStore.Store)
-	if err != nil {
-		return err
-	}
-	if err := store.EnsureVersioningDisabled(ctx, *allowVersioned); err != nil {
-		return err
-	}
-	meta, err := spdb.Open(cfg.SpDB.DSN())
-	if err != nil {
-		return err
-	}
-	defer meta.Close()
-	pg, err := c.open(ctx)
-	if err != nil {
-		return err
-	}
-	defer pg.Close()
-
-	f, err := os.Create(*out)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	w := bufio.NewWriter(f)
-	defer w.Flush()
-
-	lim := rate.NewLimiter(rate.Limit(*qps), 1)
-	var checked, residue uint64
-	var after uint64
-	for {
-		rows, err := pg.ScanIDs(ctx, after, 1000)
-		if err != nil {
+	if !*dryRun {
+		if err := pg.BeginPurge(ctx, task); err != nil {
 			return err
 		}
-		if len(rows) == 0 {
-			break
-		}
-		for _, row := range rows {
-			after = row.ObjectID
-			checked++
-			for _, prefix := range pieceop.Prefixes(row.ObjectID) {
-				var n int
-				if err := store.ListAll(ctx, prefix, func(objs []s3store.Object) error { n += len(objs); return lim.Wait(ctx) }); err != nil {
-					return fmt.Errorf("oid %d %s: %w", row.ObjectID, prefix, err)
-				}
-				if n > 0 {
-					residue++
-					fmt.Fprintf(w, "%d\t%s\t%d\n", row.ObjectID, prefix, n)
-				}
-			}
-			exists, err := meta.Exists(ctx, row.ObjectID)
-			if err != nil {
-				return err
-			}
-			if exists {
-				residue++
-				fmt.Fprintf(w, "%d\tmetadata\t1\n", row.ObjectID)
-			}
-			if checked%1000 == 0 {
-				log.Printf("verify: checked=%d residue=%d (last oid %d)", checked, residue, row.ObjectID)
-			}
-		}
 	}
-	log.Printf("verify done: checked=%d residue=%d → %s", checked, residue, *out)
-	if residue > 0 {
-		return fmt.Errorf("%d residue entries", residue)
+
+	r := &purge.Runner{
+		Store: store, Chain: chainAdapter{ch}, Meta: meta, Progress: progressAdapter{pg, task.ID},
+		Check:    pg.CheckLock,
+		OnSafety: func(cctx context.Context, oid uint64, e error) error { return pg.Hold(cctx, task.ID, &oid, e.Error()) },
+		Opt: purge.Options{Bucket: c.bucket, Concurrency: *conc, QPS: *qps, MaxRetry: *maxRetry, DryRun: *dryRun,
+			DataChunks: dc, SegmentSize: seg},
 	}
+	if err := r.Run(ctx, cnt.Total-cnt.Deferred); err != nil {
+		return err
+	}
+	if *dryRun {
+		return nil
+	}
+	left, err := pg.SubCounts(ctx, task.ID)
+	if err != nil {
+		return err
+	}
+	if left.Pending+left.Failed > 0 {
+		return fmt.Errorf("task=%d still has %d pending and %d failed objects; rerun purge", task.ID, left.Pending, left.Failed)
+	}
+	log.Printf("task=%d deletion pass finished; run verify separately before creating another task", task.ID)
 	return nil
 }
 
 // ---------------------------------------------------------------- status
 
 func runStatus(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("status", flag.ExitOnError)
+	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	var c common
 	addCommon(fs, &c)
 	failures := fs.Int("failures", 20, "how many recent failures to print")
-	fs.Parse(args)
+	taskID := fs.Uint64("task-id", 0, "show one task; default: all tasks and outstanding pool")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("unexpected arguments: %v", fs.Args())
+	}
+	if *failures < 0 {
+		return fmt.Errorf("--failures must be nonnegative")
+	}
 
 	pg, err := c.open(ctx)
 	if err != nil {
 		return err
 	}
 	defer pg.Close()
+	if c.config != "" {
+		cfg, err := spconfig.Load(c.config)
+		if err != nil {
+			return err
+		}
+		b, err := c.binding(cfg)
+		if err != nil {
+			return err
+		}
+		if err := pg.CheckBinding(ctx, b); err != nil {
+			return err
+		}
+	}
+	t, bound, err := pg.Task(ctx)
+	if err != nil {
+		return err
+	}
+	if bound {
+		fmt.Printf("task      chain=%s sp=%s storage=%s spdb=%s bucket=%s id=%d\n", t.ChainID, t.SPOperator, t.Storage, t.SpDB, t.Bucket, t.BucketID)
+		fmt.Printf("scan      status=%s bsdb_count=%s rows=%s finished=%s\n", t.ScanStatus,
+			nullInt(t.ScanBsdbCount), nullInt(t.ScanRows), nullStr(t.ScanFinishedAt))
+	} else {
+		fmt.Println("task      not bound (no scan has run against this database)")
+	}
 	cnt, err := pg.Counts(ctx)
 	if err != nil {
 		return err
@@ -395,5 +502,92 @@ func runStatus(ctx context.Context, args []string) error {
 			fmt.Println("  " + l)
 		}
 	}
+	owner, err := pg.LockOwner(ctx)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("execution_lock connection=%s\n", nullInt(owner))
+	tasks, err := pg.Subtasks(ctx)
+	if err != nil {
+		return err
+	}
+	var unfinished, completed, exceptions int
+	for _, s := range tasks {
+		if s.DoneAt.Valid {
+			completed++
+			c, err := pg.SubCounts(ctx, s.ID)
+			if err != nil {
+				return err
+			}
+			if c.Deferred > 0 {
+				exceptions++
+			}
+		} else {
+			unfinished++
+		}
+	}
+	fmt.Printf("subtasks  completed=%d (with_exceptions=%d) unfinished=%d\n", completed, exceptions, unfinished)
+	if *taskID != 0 {
+		s, err := pg.Subtask(ctx, *taskID)
+		if err != nil {
+			return err
+		}
+		tasks = []progress.Subtask{s}
+	}
+	if *taskID == 0 && unfinished == 0 {
+		fmt.Println("current   none (no unfinished task)")
+	}
+	for _, s := range tasks {
+		if *taskID == 0 && s.DoneAt.Valid {
+			continue
+		}
+		if !s.DoneAt.Valid {
+			fmt.Printf("current   task=%d\n", s.ID)
+		}
+		if err := printSubtask(ctx, pg, s, owner.Valid); err != nil {
+			return err
+		}
+		rows, err := pg.VerifyReport(ctx, s)
+		if err != nil {
+			return err
+		}
+		for i, r := range rows {
+			if i >= *failures {
+				break
+			}
+			fmt.Printf("  oid=%d %s %s\n", r.OID, r.Kind, r.Detail)
+		}
+	}
+	unassigned, deferred, err := pg.Outstanding(ctx)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("pool      unassigned=%d deferred_unresolved=%d\n", unassigned, deferred)
+	if *taskID == 0 && bound && completedNonEmptyScan(t, completed) && cnt.Total > 0 && unassigned == 0 && deferred == 0 && unfinished == 0 && !owner.Valid {
+		fmt.Println("ALL_DONE: every assigned object verified; no unassigned or deferred objects")
+	}
+	if bound && t.ScanStatus == progress.ScanComplete && (!t.ScanRows.Valid || t.ScanRows.Int64 <= 0 || cnt.Total == 0) {
+		fmt.Println("WARNING: empty or invalid sealed scan; not ALL_DONE; check bucket ID and BSDB synchronization before creating a new scan database")
+	}
 	return nil
+}
+
+// Old progress databases may contain an empty COMPLETE scan. Neither that nor
+// a manifest without any completed subtask is evidence of completed cleanup.
+func completedNonEmptyScan(t progress.Task, completed int) bool {
+	return t.ScanStatus == progress.ScanComplete && t.ScanRows.Valid && t.ScanRows.Int64 > 0 && completed > 0
+}
+
+func nullInt(v sql.NullInt64) string {
+	if !v.Valid {
+		return "-"
+	}
+	return fmt.Sprint(v.Int64)
+}
+
+func nullStr(v sql.NullString) string {
+	if !v.Valid {
+		return "-"
+	}
+	return v.String
 }

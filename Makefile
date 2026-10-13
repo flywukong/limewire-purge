@@ -1,6 +1,6 @@
 BIN := limewire-purge
 
-# The greenfield-go-sdk dependency chain (cometbft -> blst / herumi-bls) only
+# The Greenfield chain client dependency chain (cometbft -> blst / herumi-bls) only
 # compiles under Go 1.21.x, the greenfield stack's standard build toolchain,
 # and it needs CGO (bls/blst are C libraries).
 GOTOOLCHAIN := go1.21.13
@@ -23,6 +23,6 @@ linux:
 test:
 	GOTOOLCHAIN=$(GOTOOLCHAIN) go vet ./... && GOTOOLCHAIN=$(GOTOOLCHAIN) go test ./...
 
-# logic-only tests; portable to any Go version and any OS (no go-sdk/blst imports)
+# logic-only tests; portable to any Go version and any OS (no chain client/blst imports)
 test-logic:
-	go test ./internal/pieceop/ ./internal/purge/ ./internal/spconfig/
+	go test ./internal/pieceop/ ./internal/purge/ ./internal/spconfig/ ./internal/deadline/ ./internal/progress/ ./internal/bsdb/ ./internal/s3store/ ./internal/verify/

@@ -69,11 +69,11 @@ mc ls local/sp0 | head        # 应看到 s<oid>_s0 这类文件名
 准备进度库（MySQL 新库，和 SP 用同一个实例即可）：
 
 ```bash
-mysql -uroot -p -e "CREATE DATABASE IF NOT EXISTS limewire_purge"
+mysql -uroot -p -e "CREATE DATABASE limewire_purge_sp0"
 ```
 
 ```bash
-PDSN='root:PASS@tcp(127.0.0.1:3306)/limewire_purge'
+PDSN='root:PASS@tcp(127.0.0.1:3306)/limewire_purge_sp0'
 CONF=~/.local/sp0/config.toml
 
 # ① 先只数一下 bsdb，不写任何东西
@@ -82,32 +82,43 @@ CONF=~/.local/sp0/config.toml
 # ② 捞名单进 scan_objects
 ./limewire-purge scan --config $CONF --progress-dsn "$PDSN" --bucket purge-test --bucket-id <ID>
 
-# ③ dry-run：只列举不删，看命中 key 数
+# ③ 创建小任务（全量名单仍在库中）
+./limewire-purge task create --config $CONF --progress-dsn "$PDSN" \
+    --bucket purge-test --bucket-id <ID> --target-size 1GiB --max-objects 2
+
+# 可选 dry-run：只列举当前任务，不删
 ./limewire-purge purge --config $CONF --progress-dsn "$PDSN" \
     --bucket purge-test --bucket-id <ID> --chain-rpc http://127.0.0.1:26657 --chain-id greenfield_9000-121 --dry-run
 
 # ④ 正式删（sp0）
 ./limewire-purge purge --config $CONF --progress-dsn "$PDSN" \
-    --bucket purge-test --bucket-id <ID> --chain-rpc http://127.0.0.1:26657 --chain-id greenfield_9000-121
+    --bucket purge-test --bucket-id <ID> --chain-rpc http://127.0.0.1:26657 --chain-id greenfield_9000-121 --execute
 
-# ⑤ 其余 SP：换 --config 指向 spN。进度库用同一个 DSN（scan_objects 共用，
-#    但 purge_progress 会互相覆盖）——多 SP 一起测时，每个 SP 用各自的库/表前缀，
-#    第一版最简单的做法是一个 SP 一个 progress 库：/limewire_purge_sp0 等。
+# ⑤ 其余 SP：各自 scan，必须换 --config 和独立进度库，例如 limewire_purge_sp1。
+# 不共用进度库，也不复制另一个 SP 的 DONE 结果。
 
 # ⑥ 验收 + 汇总
 ./limewire-purge verify --config $CONF --progress-dsn "$PDSN" --bucket purge-test --bucket-id <ID>
 ./limewire-purge status --progress-dsn "$PDSN"
+
+# 本任务验收通过后，重复 task create → purge --execute → verify，直到 ALL_DONE。
+# 中断后直接重跑 purge / verify，无需记 task ID。
 ```
 
 ## 5. 要观察的点
 
-- `scan --count-only` 的数与 `mc ls` / 链上对象数一致 → bsdb 那条 SQL（含
+- `scan --count-only` 的数与已知逻辑对象清单一致（不能与 S3 key 数直接比较）→ bsdb 那条 SQL（含
   BINARY(32) 取右 64 位、分表号）在本地 schema 上成立。
 - dry-run 命中 key 数 = 对象段数（primary 桶）；secondary 桶为 EC 分片数。
 - 删完后 `mc ls local/sp0 | grep s<oid>_` 为空；对照对象所在桶不受影响。
-- `status` 的 done/failed/remaining 对得上；deleted_bytes 与对象大小成比例
+- `status` 的子任务成员、处理状态和验收状态对得上；deleted_bytes 与对象大小成比例
   （primary ≈ payload，secondary ≈ payload/data_chunks）。
 - SpDB 里 `integrity_meta_NN` / `piece_hash` 中该 oid 的行已清。
+- 验证默认 500GiB、超大对象独立成批、--max-objects 截断；重复 create 返回原任务。
+- 删除中途结束进程后重跑，只清实际残留；verify 中断后续验，--restart 重新检查全批。
+- 在测试桶对一个 key 制造拒删：失败保留当前任务；task defer --oid ... --reason ... 后，不计 PASS，验收其余项得到 DONE_WITH_EXCEPTIONS；再 task create --retry-deferred 显式回收该项。
+- 人为在测试 OID 前缀放未知格式 key，确认 SAFETY_HOLD 持久化且普通 purge 拒绝；人工处理并 task resume 后仍重新校验。
+- 两个命令同时运行，后者被执行锁拒绝；测试库中断持锁连接后，当前进程停止派发。不同 SP 的独立库可以并行。
 
 ## 6. 注意
 
@@ -115,4 +126,4 @@ CONF=~/.local/sp0/config.toml
   `pkill -f gnfd-challenger`（或按部署脚本停 challenger0..5）。
 - 每个 SP 用各自的 `--config`；MinIO root 账号能删所有桶，本地没有 IRSA
   的桶级隔离，靠 config 指对 sp。
-- 反复测试时 `DROP DATABASE limewire_purge` 重来；或换新 progress 库。
+- 反复全流程测试使用新的空进度库，保留旧记录便于核对；不要直接改任务状态绕过验收。

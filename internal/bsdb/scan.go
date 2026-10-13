@@ -52,6 +52,19 @@ func (s *Scanner) Count(ctx context.Context, bucketID uint64, bucketName string)
 	return n, err
 }
 
+// Reconcile decides whether a scan read the bucket's whole object list: the live
+// count must be the same before and after the scan (the bucket did not change
+// underneath it), and the scan must have read exactly that many rows.
+func Reconcile(countBefore, countAfter, read uint64) error {
+	if countBefore != countAfter {
+		return fmt.Errorf("bsdb count changed during the scan (%d before, %d after); the bucket is not stable, re-run scan", countBefore, countAfter)
+	}
+	if read != countBefore {
+		return fmt.Errorf("scan read %d rows but bsdb counts %d live objects; the list is incomplete, re-run scan", read, countBefore)
+	}
+	return nil
+}
+
 // Scan walks the shard by primary key in batches and hands each batch to fn.
 // The table has no bucket index, so this is a full scan of the shard; keyset paging
 // keeps every statement short.
@@ -84,6 +97,12 @@ func (s *Scanner) Scan(ctx context.Context, bucketID uint64, bucketName string, 
 			r.Status = strings.TrimPrefix(r.Status, "OBJECT_STATUS_")
 			lastID = id
 			out = append(out, r)
+		}
+		// rows.Next also returns false when the connection breaks mid-batch; without
+		// this check a short batch would read as the end of the table
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return total, fmt.Errorf("bsdb read after row id %d: %w", lastID, err)
 		}
 		rows.Close()
 		if len(out) == 0 {

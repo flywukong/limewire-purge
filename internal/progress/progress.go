@@ -1,7 +1,9 @@
-// Package progress owns the tool's two tables:
+// Package progress owns the tool's manifest, subtask and progress tables:
 //
+//	task_meta      – one row: which task this database belongs to, and whether the list is complete
 //	scan_objects   – the immutable object list scan pulled from bsdb
 //	purge_progress – one row per object once it has been fully processed (or failed)
+//	purge_tasks / task_objects / task_events – subtask membership, verification and operator decisions
 //
 // "Not yet processed" is simply scan_objects minus purge_progress.
 package progress
@@ -9,10 +11,12 @@ package progress
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
+	"time"
 
-	_ "github.com/go-sql-driver/mysql"
+	"github.com/go-sql-driver/mysql"
 )
 
 const (
@@ -20,30 +24,59 @@ const (
 	StatusFailed = 2
 )
 
-type DB struct{ db *sql.DB }
+type DB struct {
+	db   *sql.DB
+	lock *Lock
+}
 
 func Open(dsn string) (*DB, error) {
-	db, err := sql.Open("mysql", dsn)
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.DBName == "" {
+		return nil, fmt.Errorf("progress DSN must name a dedicated database")
+	}
+	if cfg.Timeout == 0 {
+		cfg.Timeout = 10 * time.Second
+	}
+	if cfg.ReadTimeout == 0 {
+		cfg.ReadTimeout = 30 * time.Second
+	}
+	if cfg.WriteTimeout == 0 {
+		cfg.WriteTimeout = 30 * time.Second
+	}
+	db, err := sql.Open("mysql", cfg.FormatDSN())
 	if err != nil {
 		return nil, err
 	}
 	db.SetMaxOpenConns(16)
 	if err := db.Ping(); err != nil {
+		db.Close()
 		return nil, fmt.Errorf("progress db: %w", err)
 	}
 	return &DB{db: db}, nil
 }
 
-func (p *DB) Close() error { return p.db.Close() }
+func (p *DB) Close() error {
+	var err error
+	if p.lock != nil {
+		err = p.lock.Close()
+	}
+	return errors.Join(err, p.db.Close())
+}
 
 func (p *DB) EnsureSchema(ctx context.Context) error {
+	if err := p.CheckLock(ctx); err != nil {
+		return err
+	}
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS scan_objects (
 		   object_id    BIGINT UNSIGNED NOT NULL PRIMARY KEY,
 		   payload_size BIGINT UNSIGNED NOT NULL,
 		   status       VARCHAR(16) NOT NULL,
 		   version      INT NOT NULL DEFAULT 0
-		 )`,
+		 ) ENGINE=InnoDB`,
 		`CREATE TABLE IF NOT EXISTS purge_progress (
 		   object_id     BIGINT UNSIGNED NOT NULL PRIMARY KEY,
 		   status        TINYINT NOT NULL,
@@ -54,7 +87,45 @@ func (p *DB) EnsureSchema(ctx context.Context) error {
 		   expected_bytes BIGINT UNSIGNED NULL,
 		   updated_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 		   KEY idx_status (status)
-		 )`,
+		 ) ENGINE=InnoDB`,
+		`CREATE TABLE IF NOT EXISTS task_meta (
+		   id               TINYINT UNSIGNED NOT NULL PRIMARY KEY,
+		   chain_id         VARCHAR(64) NOT NULL,
+		   sp_operator      VARCHAR(128) NOT NULL,
+		   storage          VARCHAR(512) NOT NULL,
+		   spdb             VARCHAR(512) NOT NULL,
+		   bucket_name      VARCHAR(64) NOT NULL,
+		   bucket_id        BIGINT UNSIGNED NOT NULL,
+		   scan_status      VARCHAR(16) NOT NULL DEFAULT 'NONE',
+		   scan_bsdb_count  BIGINT UNSIGNED NULL,
+		   scan_rows        BIGINT UNSIGNED NULL,
+		   scan_finished_at TIMESTAMP NULL,
+		   created_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+		 ) ENGINE=InnoDB`,
+		`CREATE TABLE IF NOT EXISTS purge_tasks (
+		 id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		 target_bytes BIGINT UNSIGNED NOT NULL, object_count BIGINT UNSIGNED NOT NULL,
+		 logical_bytes BIGINT UNSIGNED NOT NULL, digest CHAR(64) NOT NULL,
+		 phase VARCHAR(16) NOT NULL DEFAULT 'READY',
+		 hold_reason VARCHAR(4000) NOT NULL DEFAULT '', hold_oid BIGINT UNSIGNED NULL,
+		 verify_generation BIGINT UNSIGNED NOT NULL DEFAULT 1,
+		 done_at TIMESTAMP NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+		) ENGINE=InnoDB`,
+		`CREATE TABLE IF NOT EXISTS task_objects (
+		 task_id BIGINT UNSIGNED NOT NULL, object_id BIGINT UNSIGNED NOT NULL,
+		 deferred BOOLEAN NOT NULL DEFAULT 0, defer_reason VARCHAR(4000) NOT NULL DEFAULT '',
+		 deferred_at TIMESTAMP NULL, verify_generation BIGINT UNSIGNED NOT NULL DEFAULT 0,
+		 verify_status VARCHAR(16) NOT NULL DEFAULT 'PENDING',
+		 verify_detail VARCHAR(4000) NOT NULL DEFAULT '', verified_at TIMESTAMP NULL,
+		 PRIMARY KEY(task_id,object_id), KEY idx_oid(object_id)
+		) ENGINE=InnoDB`,
+		`CREATE TABLE IF NOT EXISTS task_events (
+		 id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		 task_id BIGINT UNSIGNED NOT NULL, object_id BIGINT UNSIGNED NULL,
+		 action VARCHAR(16) NOT NULL, reason TEXT NOT NULL,
+		 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		 KEY idx_task(task_id)
+		) ENGINE=InnoDB`,
 	}
 	for _, s := range stmts {
 		if _, err := p.db.ExecContext(ctx, s); err != nil {
@@ -78,6 +149,16 @@ func (p *DB) EnsureSchema(ctx context.Context) error {
 			}
 		}
 	}
+	// Task allocation and progress rely on transactions, including upgraded DBs.
+	var nonTransactional int
+	if err := p.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM information_schema.tables
+	 WHERE table_schema=DATABASE() AND table_name IN ('task_meta','scan_objects','purge_progress','purge_tasks','task_objects','task_events')
+	 AND engine<>'InnoDB'`).Scan(&nonTransactional); err != nil {
+		return err
+	}
+	if nonTransactional != 0 {
+		return fmt.Errorf("progress tables must use InnoDB; review/migrate storage engines before running")
+	}
 	return nil
 }
 
@@ -91,6 +172,9 @@ type ScanRow struct {
 
 // InsertScan writes a batch of scan rows; re-running scan is harmless (INSERT IGNORE).
 func (p *DB) InsertScan(ctx context.Context, rows []ScanRow) error {
+	if err := p.CheckLock(ctx); err != nil {
+		return err
+	}
 	if len(rows) == 0 {
 		return nil
 	}
@@ -108,22 +192,24 @@ func (p *DB) InsertScan(ctx context.Context, rows []ScanRow) error {
 	return err
 }
 
-// ClaimRow is one claimed object with the payload size scan recorded from bsdb.
+// ClaimRow is one claimed object with the snapshot scan recorded from bsdb.
 type ClaimRow struct {
 	ObjectID    uint64
 	PayloadSize uint64
+	Status      string
+	Version     int64
 }
 
 // Claim returns up to limit objects with id greater than after that still need work:
 // never processed (retryFailed=false) or previously failed (retryFailed=true).
 // Callers page with the last id they received, so in-flight ids are never handed out twice.
 func (p *DB) Claim(ctx context.Context, after uint64, limit int, retryFailed bool) ([]ClaimRow, error) {
-	q := `SELECT s.object_id, s.payload_size FROM scan_objects s
+	q := `SELECT s.object_id, s.payload_size, s.status, s.version FROM scan_objects s
 	      LEFT JOIN purge_progress p ON p.object_id = s.object_id
 	      WHERE s.object_id > ? AND p.object_id IS NULL
 	      ORDER BY s.object_id LIMIT ?`
 	if retryFailed {
-		q = `SELECT s.object_id, s.payload_size FROM scan_objects s
+		q = `SELECT s.object_id, s.payload_size, s.status, s.version FROM scan_objects s
 		     JOIN purge_progress p ON p.object_id = s.object_id
 		     WHERE s.object_id > ? AND p.status = 2
 		     ORDER BY s.object_id LIMIT ?`
@@ -136,7 +222,7 @@ func (p *DB) Claim(ctx context.Context, after uint64, limit int, retryFailed boo
 	var out []ClaimRow
 	for rows.Next() {
 		var c ClaimRow
-		if err := rows.Scan(&c.ObjectID, &c.PayloadSize); err != nil {
+		if err := rows.Scan(&c.ObjectID, &c.PayloadSize, &c.Status, &c.Version); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
