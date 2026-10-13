@@ -1,5 +1,7 @@
 # 本地环境测试步骤
 
+若是回到之前已经部署好的 QA / SP 环境，优先使用 [TESTING.md 的现有环境回归步骤](../TESTING.md#现有-qa--sp-环境回归优先走这里)，不要重新初始化集群或切换存储。该步骤包含更新版本、小任务运行、Suspended 桶参数和本轮故障回归项目。
+
 适用于 greenfield-deploy 起的本地集群（sp0…sp6、MySQL、链 REST 在 :1317），SP 存储后端已按 README 说明切到 MinIO。
 
 ## 0. 前提
@@ -17,7 +19,7 @@ git clone git@github.com:flywukong/limewire-purge.git && cd limewire-purge && ma
 scp limewire-purge-linux-amd64 root@<host>:/usr/local/bin/limewire-purge
 ```
 
-或者主机上有 Go 1.21+ 时直接 `make build`。
+或者在部署机上按固定 Go 1.21.13 + CGO/C 编译器要求直接 `make build`。跨平台构建还需要对应的 C 交叉工具链，不能仅设置 GOOS。
 
 ## 2. 建工具自己的库
 

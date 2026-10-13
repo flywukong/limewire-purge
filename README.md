@@ -34,6 +34,8 @@ verify：独立检查当前任务两个前缀 + 本地元数据，逐 OID 保存
 
 ## 操作命令
 
+**回到之前的 QA / SP 测试环境**：先按 [现有环境回归步骤](TESTING.md#现有-qa--sp-环境回归优先走这里) 更新工具，在同一测试环境用新的一轮独立进度库和小任务验证。不要照搬后面的本地 MinIO 初始化步骤重置现有集群；测试 RPC、chain ID、bucket ID 必须来自该环境。若物理桶为 Suspended/Enabled 且接受历史版本不在清理范围内，purge 和 verify 都要加 `--allow-versioned-bucket`。
+
 下面仅为示例，不会自动执行。替换所有测试参数，并检查创建任务时打印的范围及容量。
 
 ```bash

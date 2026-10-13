@@ -1,4 +1,85 @@
-# 在本地 Greenfield 环境测试 limewire-purge
+# 清理工具回归测试
+
+## 现有 QA / SP 环境回归（优先走这里）
+
+用于回到之前已经部署好的测试环境，不重建链、不切换 S3/MinIO 后端、不重置 SP。本文命令是操作示例，需确认环境和授权后人工分阶段执行。
+
+### 1. 更新工具和确认范围
+
+- 在现有代码目录检查 `git status --short`、`git remote -v` 和 `git branch -vv`，确认仓库/分支无误且没有未保存修改后，再 `git pull --ff-only`。
+- 在测试环境对应的 Linux 构建机执行 `make build`、`make test`，记录 `git rev-parse HEAD`；替换二进制前停止旧的清理工具进程，避免测试时混用版本。编译要求见后面的本地环境章节。
+- 确认本 SP 的 config、BSDB/SpDB、物理桶、链 RPC/chain ID、目标 bucket 名称/ID。先处置测试范围的 challenge/attestation 风险，停止目标对象的回写，核对 BSDB 已同步。
+- 使用本轮新建的空 MySQL 进度库，**每个 SP 一个库**。旧库保留；不要删除旧记录、复制其他 SP 的库或手改 COMPLETE/DONE 状态。若只是本轮中断续跑，则继续用本轮同一个库，不再创建新库。
+- 准备新测试对象：小对象、多段对象，以及另一个逻辑 bucket 的对照对象。记录对照对象的内容摘要，清理前后都验证可读且摘要一致。只有要覆盖超过 1000 key 的分批路径时，才需要按实际 segment 参数准备足够大的对象。
+
+### 2. 参数、全量扫描和小任务
+
+以下环境变量由操作者填写；DSN/凭证通过现有安全机制提供，不写入仓库。这里不预设 QA 地址、chain ID 或 bucket ID。
+
+```bash
+# Bash / Zsh
+: "${PURGE_CONFIG:?本 SP config.toml 路径}"
+: "${PURGE_PROGRESS_DSN:?本轮本 SP 独立进度库 DSN}"
+: "${PURGE_BUCKET:?本轮授权测试 bucket 名称}"
+: "${PURGE_BUCKET_ID:?该测试 bucket 的链上 ID}"
+: "${PURGE_CHAIN_RPC:?该测试环境的 CometBFT RPC URL}"
+: "${PURGE_CHAIN_ID:?该测试环境 chain ID，与 SP config 一致}"
+purge_common=(--config "$PURGE_CONFIG" --progress-dsn "$PURGE_PROGRESS_DSN"
+  --bucket "$PURGE_BUCKET" --bucket-id "$PURGE_BUCKET_ID")
+purge_chain=(--chain-rpc "$PURGE_CHAIN_RPC" --chain-id "$PURGE_CHAIN_ID")
+purge_storage=()
+# 仅当物理桶为 Enabled/Suspended，且已确认接受历史版本不清理时使用：
+# purge_storage=(--allow-versioned-bucket)
+
+./limewire-purge scan "${purge_common[@]}" --count-only
+# 先确认计数与测试对象名单相符，再逐条执行：
+./limewire-purge scan "${purge_common[@]}"
+./limewire-purge task create "${purge_common[@]}" --target-size 1GiB --max-objects 2
+./limewire-purge status "${purge_common[@]}"
+```
+
+如果物理桶处于 Suspended，不能只给 purge 加参数而漏掉 verify。放行后 PASS/DONE 不证明历史版本、删除标记或账单空间已清除。
+
+### 3. 人工检查摘要后再执行
+
+核对当前 task ID、OID 数量、逻辑容量及环境绑定，再运行。下面不自动创建下一批；一次只处理已检查的小任务。
+
+```bash
+set -o pipefail
+mkdir -p ./test-logs
+./limewire-purge purge "${purge_common[@]}" "${purge_chain[@]}" "${purge_storage[@]}" \
+  --execute --concurrency 1 --qps 5 --max-retry 10 2>&1 | tee ./test-logs/purge.log
+```
+
+确认 purge 成功退出后，**单独**执行验收：
+
+```bash
+./limewire-purge verify "${purge_common[@]}" "${purge_storage[@]}" \
+  --qps 5 --out ./test-logs/residue.tsv 2>&1 | tee ./test-logs/verify.log
+./limewire-purge status "${purge_common[@]}"
+```
+
+每轮保留日志（下轮前换路径，避免覆盖）。正式脚本可给 purge 加 `--task-id N` 固定到已检查的任务；手动操作默认当前任务。只有本批通过后才再次 `task create`。检查对照对象仍可读且摘要相同后，再扩大容量/并发，不直接开始全量清理。
+
+### 4. 这版必须回归的项目
+
+| 场景 | 预期结果 |
+|---|---|
+| 空扫描/错误 bucket ID | count-only 可显示 0；正式 scan 报错、不封存；历史空库不显示 ALL_DONE |
+| 正常小任务 | 链上身份检查 → 按前缀批删 → 清本地元数据 → 独立 verify → DONE；其他 bucket 对照数据不变 |
+| 无任务/错误 task ID | purge 不自动创建任务；传入与当前任务不同的 ID 时拒绝删除 |
+| 短暂 RPC/SpDB 故障 | 临时错误最多 3 次应用层尝试，间隔 1 秒/2 秒；恢复后继续，永久错误不盲目重试 |
+| piece 重试耗尽，并发设为 2 | 打印 !!! STOP 和 task/OID/原因；不开始新对象，在途对象完成或自身失败并尽量落库后退出；不自动补跑、不产生普通失败的 SAFETY_HOLD |
+| 普通失败排障后重跑 | 原 purge 命令继续失败和未完成对象，保留已完成进度，不需 task resume；部分残留重新列举 |
+| Ctrl+C/失锁/安全异常 | 立即取消，不等待普通失败收尾；安全异常持久化 SAFETY_HOLD |
+| verify 中断/残留 | 重跑续验；RESIDUE 要先 purge 再整批验收。verify 的 ERROR 目前仍记录后继续检查，不采用 purge 的停止策略 |
+| Suspended/Enabled 桶 | 默认拒绝；purge 和 verify 显式放行后可运行，日志说明历史版本不在范围内 |
+
+故障注入只能作用于授权测试对象/隔离测试服务，不要修改整个共享桶的策略或中断其他租户的数据库。收尾时间取决于在途对象大小和请求耗时，不承诺几分钟内结束。验收证据保留：代码 SHA、测试环境/任务摘要、日志、verify 报告、对照对象前后摘要；不要收集凭证。
+
+---
+
+## 新建本地 Greenfield / MinIO 环境（已有 QA 环境无需执行）
 
 前提：本地集群已起（validators + sp0..sp6 + challenger + MySQL），SP 存储后端为
 MinIO（见下文），链 CometBFT RPC 在 `http://127.0.0.1:26657`（本地验证器的 RPC 端口，非 REST 的 1317）。测试桶名假设为 `purge-test`。
