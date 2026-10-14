@@ -67,7 +67,10 @@ mkdir -p ./test-logs
 |---|---|
 | 空扫描/错误 bucket ID | count-only 可显示 0；正式 scan 报错、不封存；历史空库不显示 ALL_DONE |
 | 正常小任务 | 链上身份检查 → 按前缀批删 → 清本地元数据 → 独立 verify → DONE；其他 bucket 对照数据不变 |
-| 无任务/错误 task ID | purge 不自动创建任务；传入与当前任务不同的 ID 时拒绝删除 |
+| 无任务/显式 task ID | purge 不自动创建；默认只选当前待删任务；显式 ID 可补删旧未验收批次，不能直接删已 DONE 批次 |
+| 删除与验收解耦 | 第一批 purge 后不 verify，直接创建并删除第二批；默认 verify 仍选第一批，每次仅验一批；全部删除但未验收时不得 ALL_DONE |
+| 旧批次验收失败 | 第一批 RESIDUE / ERROR 不阻塞第二批；按 ID 补删第一批后整批重新验收；任一批 SAFETY_HOLD 仍禁止继续创建/删除 |
+| 多任务运行显示 | status 只把当前持锁连接匹配的批次显示为 RUNNING / VERIFYING，其余待验收批次不误标运行 |
 | 短暂 RPC/SpDB 故障 | 临时错误最多 3 次应用层尝试，间隔 1 秒/2 秒；恢复后继续，永久错误不盲目重试 |
 | piece 重试耗尽，并发设为 2 | 打印 !!! STOP 和 task/OID/原因；不开始新对象，在途对象完成或自身失败并尽量落库后退出；不自动补跑、不产生普通失败的 SAFETY_HOLD |
 | 普通失败排障后重跑 | 原 purge 命令继续失败和未完成对象，保留已完成进度，不需 task resume；部分残留重新列举 |
@@ -182,8 +185,8 @@ CONF=~/.local/sp0/config.toml
 ./limewire-purge verify --config $CONF --progress-dsn "$PDSN" --bucket purge-test --bucket-id <ID>
 ./limewire-purge status --progress-dsn "$PDSN"
 
-# 本任务验收通过后，重复 task create → purge --execute → verify，直到 ALL_DONE。
-# 中断后直接重跑 purge / verify，无需记 task ID。
+# 本任务删除成功后，即可重复 task create → purge --execute；verify 可稍后逐批执行。
+# 默认 verify 每次验最早待验收批次；旧批次补删请显式 --task-id N，全部验收完成才 ALL_DONE。
 ```
 
 ## 5. 要观察的点

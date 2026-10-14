@@ -11,7 +11,8 @@ import (
 	"strings"
 )
 
-var ErrNoCurrentTask = errors.New("no unfinished subtask; run task create first (or supply --task-id for history)")
+var ErrNoCurrentTask = errors.New("no current deletion subtask; run task create first (or supply --task-id for repair/history)")
+var ErrNoVerifyTask = errors.New("no task awaiting verification")
 var ErrNoUnassigned = errors.New("no unassigned objects; inspect status for deferred objects and final completion")
 
 type Subtask struct {
@@ -20,6 +21,12 @@ type Subtask struct {
 	HoldOID                                    sql.NullInt64
 	Generation                                 uint64
 	DoneAt                                     sql.NullString
+	PurgedAt                                   sql.NullString
+	ExecutionConnectionID                      sql.NullInt64
+}
+
+func (s Subtask) LockedBy(owner sql.NullInt64) bool {
+	return owner.Valid && s.ExecutionConnectionID.Valid && owner.Int64 == s.ExecutionConnectionID.Int64
 }
 
 type SubCounts struct {
@@ -103,12 +110,12 @@ func digestRows(rows []ScanRow) string {
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
-const taskSelect = `SELECT id,target_bytes,object_count,logical_bytes,digest,phase,hold_reason,hold_oid,verify_generation,CAST(done_at AS CHAR) FROM purge_tasks`
+const taskSelect = `SELECT id,target_bytes,object_count,logical_bytes,digest,phase,hold_reason,hold_oid,verify_generation,CAST(done_at AS CHAR),CAST(purged_at AS CHAR),execution_connection_id FROM purge_tasks`
 
 type rowScanner interface{ Scan(...any) error }
 
 func readSubtask(row rowScanner) (s Subtask, err error) {
-	err = row.Scan(&s.ID, &s.TargetBytes, &s.ObjectCount, &s.LogicalBytes, &s.Digest, &s.Phase, &s.HoldReason, &s.HoldOID, &s.Generation, &s.DoneAt)
+	err = row.Scan(&s.ID, &s.TargetBytes, &s.ObjectCount, &s.LogicalBytes, &s.Digest, &s.Phase, &s.HoldReason, &s.HoldOID, &s.Generation, &s.DoneAt, &s.PurgedAt, &s.ExecutionConnectionID)
 	return
 }
 
@@ -120,7 +127,7 @@ func (p *DB) ResolveSubtask(ctx context.Context, id uint64) (Subtask, error) {
 	if id > 0 {
 		return p.Subtask(ctx, id)
 	}
-	rows, err := p.db.QueryContext(ctx, taskSelect+` WHERE done_at IS NULL ORDER BY id LIMIT 2`)
+	rows, err := p.db.QueryContext(ctx, taskSelect+` WHERE done_at IS NULL AND purged_at IS NULL ORDER BY id LIMIT 2`)
 	if err != nil {
 		return Subtask{}, err
 	}
@@ -147,6 +154,68 @@ func (p *DB) ResolveCurrentSubtask(ctx context.Context, expected uint64) (Subtas
 		return Subtask{}, err
 	}
 	return selectCurrent([]Subtask{s}, expected)
+}
+
+// Explicit IDs may repair a deletion-complete but unverified task. Default
+// selection never falls back from the current deletion task to an older batch.
+func (p *DB) ResolvePurgeSubtask(ctx context.Context, id uint64) (Subtask, error) {
+	if err := p.RequireNoSafetyHold(ctx); err != nil {
+		return Subtask{}, err
+	}
+	if id != 0 {
+		s, err := p.Subtask(ctx, id)
+		if err != nil {
+			return s, err
+		}
+		if s.DoneAt.Valid {
+			return s, errors.New("task already verified; use verify --task-id N --restart before any repair")
+		}
+		if s.PurgedAt.Valid {
+			return s, nil
+		}
+	}
+	return p.ResolveCurrentSubtask(ctx, id)
+}
+
+func (p *DB) ResolveVerifySubtask(ctx context.Context, id uint64) (Subtask, error) {
+	if id != 0 {
+		return p.Subtask(ctx, id)
+	}
+	s, err := readSubtask(p.db.QueryRowContext(ctx, taskSelect+` WHERE done_at IS NULL AND purged_at IS NOT NULL ORDER BY id LIMIT 1`))
+	if errors.Is(err, sql.ErrNoRows) {
+		return s, ErrNoVerifyTask
+	}
+	return s, err
+}
+
+// Administrative actions default to a held task, then the current deletion
+// task, then the oldest verification task. An explicit ID is required whenever
+// targeting another unverified batch (e.g. deferring old verification residue).
+func (p *DB) ResolveAdminSubtask(ctx context.Context, id uint64) (Subtask, error) {
+	if id != 0 {
+		return p.Subtask(ctx, id)
+	}
+	s, err := readSubtask(p.db.QueryRowContext(ctx, taskSelect+` WHERE done_at IS NULL AND hold_reason<>'' ORDER BY id LIMIT 1`))
+	if !errors.Is(err, sql.ErrNoRows) {
+		return s, err
+	}
+	s, err = p.ResolveCurrentSubtask(ctx, 0)
+	if !errors.Is(err, ErrNoCurrentTask) {
+		return s, err
+	}
+	return p.ResolveVerifySubtask(ctx, 0)
+}
+
+func (p *DB) RequireNoSafetyHold(ctx context.Context) error {
+	var id uint64
+	err := p.db.QueryRowContext(ctx, `SELECT id FROM purge_tasks WHERE hold_reason<>'' ORDER BY id LIMIT 1`).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return fmt.Errorf("SAFETY_HOLD on task %d; investigate and task resume --task-id %d first", id, id)
 }
 
 func selectCurrent(found []Subtask, expected uint64) (Subtask, error) {
@@ -207,6 +276,9 @@ func (p *DB) CreateSubtask(ctx context.Context, target uint64, max int, retryDef
 	if err := p.RequireCompleteScan(ctx); err != nil {
 		return Subtask{}, err
 	}
+	if err := p.RequireNoSafetyHold(ctx); err != nil {
+		return Subtask{}, err
+	}
 	if s, err := p.ResolveSubtask(ctx, 0); err == nil {
 		return s, nil
 	} else if !errors.Is(err, ErrNoCurrentTask) {
@@ -231,7 +303,7 @@ func (p *DB) CreateSubtask(ctx context.Context, target uint64, max int, retryDef
 	condition := `NOT EXISTS (SELECT 1 FROM task_objects o WHERE o.object_id=s.object_id)`
 	if retryDeferred {
 		condition = `EXISTS (SELECT 1 FROM task_objects o JOIN purge_tasks t ON t.id=o.task_id
- WHERE o.object_id=s.object_id AND o.deferred=1 AND t.done_at IS NOT NULL
+ WHERE o.object_id=s.object_id AND o.deferred=1 AND t.purged_at IS NOT NULL
  AND NOT EXISTS (SELECT 1 FROM task_objects newer WHERE newer.object_id=o.object_id AND newer.task_id>o.task_id))`
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT s.object_id,s.payload_size,s.status,s.version FROM scan_objects s WHERE `+condition+` ORDER BY s.object_id LIMIT ?`, max)
@@ -340,6 +412,9 @@ func (p *DB) BeginPurge(ctx context.Context, s Subtask) error {
 	if s.DoneAt.Valid || s.HoldReason != "" {
 		return errors.New("task is completed or on SAFETY_HOLD")
 	}
+	if err := p.RequireNoSafetyHold(ctx); err != nil {
+		return err
+	}
 	if err := p.CheckManifest(ctx, s); err != nil {
 		return err
 	}
@@ -355,11 +430,40 @@ func (p *DB) BeginPurge(ctx context.Context, s Subtask) error {
 	if err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `UPDATE purge_tasks SET phase='PURGE',verify_generation=verify_generation+1 WHERE id=? AND done_at IS NULL AND hold_reason=''`, s.ID)
+	_, err = tx.ExecContext(ctx, `UPDATE purge_tasks SET phase='PURGE',verify_generation=verify_generation+1,execution_connection_id=? WHERE id=? AND done_at IS NULL AND hold_reason=''`, p.lock.id, s.ID)
 	if err != nil {
 		return err
 	}
 	return tx.Commit()
+}
+
+// PurgedAt releases allocation of the next batch, but is never verification.
+// Keep this milestone on later repairs so old residue cannot block new batches.
+func (p *DB) CompletePurge(ctx context.Context, s Subtask) error {
+	if err := p.CheckLock(ctx); err != nil {
+		return err
+	}
+	c, err := p.SubCounts(ctx, s.ID)
+	if err != nil {
+		return err
+	}
+	if c.Total == 0 || c.Total != s.ObjectCount || c.Pending+c.Failed > 0 {
+		return fmt.Errorf("deletion incomplete: pending=%d failed=%d total=%d", c.Pending, c.Failed, c.Total)
+	}
+	_, err = p.db.ExecContext(ctx, `UPDATE purge_tasks SET purged_at=COALESCE(purged_at,CURRENT_TIMESTAMP),phase='PURGE'
+ WHERE id=? AND done_at IS NULL AND hold_reason=''`, s.ID)
+	if err != nil {
+		return err
+	}
+	// RowsAffected may be zero on an idempotent call; read back the guard fields.
+	now, err := p.Subtask(ctx, s.ID)
+	if err != nil {
+		return err
+	}
+	if !now.PurgedAt.Valid || now.HoldReason != "" || now.DoneAt.Valid {
+		return errors.New("task could not be marked deletion-complete")
+	}
+	return nil
 }
 
 func (p *DB) Hold(ctx context.Context, id uint64, oid *uint64, reason string) error {
@@ -394,20 +498,11 @@ func (p *DB) BeginVerify(ctx context.Context, s Subtask, restart bool) (Subtask,
 	if c.Pending+c.Failed > 0 {
 		return s, errors.New("task has unprocessed/failed objects; purge or explicitly defer them before verify")
 	}
-	// Reopening historical tasks must not manufacture a second active task.
-	if s.DoneAt.Valid {
-		var n int
-		if err := p.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM purge_tasks WHERE done_at IS NULL`).Scan(&n); err != nil {
-			return s, err
-		}
-		if n > 0 {
-			return s, errors.New("another unfinished task exists; cannot reopen historical verification")
-		}
-	}
+	// Historical verification is independent of the current deletion batch.
 	if restart {
 		s.Generation++
 	}
-	_, err = p.db.ExecContext(ctx, `UPDATE purge_tasks SET phase='VERIFY',verify_generation=?,done_at=NULL WHERE id=?`, s.Generation, s.ID)
+	_, err = p.db.ExecContext(ctx, `UPDATE purge_tasks SET phase='VERIFY',verify_generation=?,done_at=NULL,purged_at=COALESCE(purged_at,CURRENT_TIMESTAMP),execution_connection_id=? WHERE id=?`, s.Generation, p.lock.id, s.ID)
 	if err != nil {
 		return s, err
 	}
@@ -512,7 +607,17 @@ func (p *DB) DeferObject(ctx context.Context, s Subtask, oid uint64, reason stri
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	c, err := p.SubCounts(ctx, s.ID)
+	if err != nil {
+		return err
+	}
+	if c.Pending+c.Failed == 0 {
+		return p.CompletePurge(ctx, s)
+	}
+	return nil
 }
 
 func (p *DB) ResumeSafety(ctx context.Context, s Subtask, reason string) error {

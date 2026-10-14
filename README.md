@@ -11,24 +11,25 @@ scan 全量落库 → 数量对账 → COMPLETE 封存
     ↓
 task create：按约 500 GiB（可配置）固定本批 OID
     ↓
-purge --execute：仅当前任务，逐 OID 查链 → 批删 → 清本地元数据 → 记进度
-    ↓
-verify：独立检查当前任务两个前缀 + 本地元数据，逐 OID 保存验收结果
+purge --execute：当前待删除任务，逐 OID 查链 → 批删 → 清本地元数据 → 记进度
+    ├─ 本批删除成功：写 purged_at → 可以 task create 下一批，不必等 verify
+    ↓（可稍后单独执行，同一进度库仍禁止命令并发）
+verify：默认验收最早一批待验收任务，逐 OID 保存验收结果
     ├─ ERROR：重跑 verify，跳过本代次已 PASS 的对象
-    ├─ RESIDUE：重跑 purge 清残留，再 verify 整批
-    └─ 全部 PASS：DONE，可以 task create 下一批
+    ├─ RESIDUE：purge --task-id N 补删，再 verify --task-id N 整批
+    └─ 全部 PASS：DONE；所有批次验收完成且无延期项才显示 ALL_DONE
 
 处理不了的 OID → 人工 task defer --oid … --reason …
     → 不计 PASS，保留在延期池
-    → 其余对象验收通过：DONE_WITH_EXCEPTIONS，可继续下一批
+    → 其余对象删除成功即可下一批；验收通过后为 DONE_WITH_EXCEPTIONS
     → 后续 task create --retry-deferred 显式重试延期池
 ```
 
-无需人工记录 task ID：`purge / verify / task defer / task resume` 默认选择唯一未完成任务。重复 `task create` 返回现有未完成任务，不会另开一批。没有当前任务时，`purge --execute` 报错并提示先运行 `task create`，绝不自动创建。
+默认 `purge` 选择唯一待删除任务；`verify` 每次选择最早一批删除已完成但尚未验收完成的任务，不自动连续验收。重复 `task create` 在仍有待删除任务时返回它；仅有待验收任务则允许创建下一批。无当前删除任务时，`purge --execute` 报错并提示先 `task create`，绝不自动创建或自动补删旧批次。
 
-正式删除脚本建议带 `--task-id N`，固定为人工检查过的任务 ID：对 `purge / task defer / task resume`，这个参数必须等于当前任务 ID，否则拒绝执行，而不是切换到另一批。`task exclude` 是 `task defer` 的别名，同样记原因、留在延期池、不算 PASS。
+正式删除脚本建议带 `--task-id N`，固定人工检查的名单。`purge --task-id N` 除当前待删除任务外，也允许补删已删除但未验收完成的旧批次；已 DONE 的批次仍禁止直接 purge。`task defer / resume --task-id N` 明确指定未验收完成的任务；不传 ID 时优先安全暂停批次，其次当前待删除批次，最后最早待验收批次。`task exclude` 是 defer 的别名，同样记原因、不算 PASS。
 
-`task create / purge / verify` 选定任务后的首条日志打印 `task=N`、对象数和逻辑容量，后续处理日志也带任务 ID。默认 `verify` 在没有待验收任务时明确报错；历史查询用 `status --task-id N`，历史重新验收用 `verify --task-id N --restart`（不得有其他未完成任务）。
+`task create / purge / verify` 首条日志打印 `task=N`、对象数和逻辑容量，后续日志也带任务 ID。默认 verify 无待验收任务时明确报错。历史查询用 `status --task-id N`，历史复验用 `verify --task-id N --restart`，可以存在其他批次，但不允许同库命令同时运行。任一批次的 SAFETY_HOLD 都会阻止创建和删除，不能靠切换批次绕过。
 
 本版本不自动连续执行。试运行后可把任务调大，例如 `--target-size 5TiB --max-objects 100000`（仍可能先达到对象数上限）；以后可用外部脚本串联，但必须检查验收结果、安全暂停和延期项，不能只写无限循环。
 
@@ -61,7 +62,7 @@ purge_chain=(
 ./limewire-purge purge "${purge_common[@]}" "${purge_chain[@]}" --execute --concurrency 1 --qps 5
 ./limewire-purge verify "${purge_common[@]}" --qps 5
 
-# 本批完成后再选下一批；容量指逻辑 payload，不是本 SP 释放空间。
+# 小规模回归建议先验收；正式批次删除成功后即可下一批，不必逐批等 verify。
 ./limewire-purge task create "${purge_common[@]}" --target-size 500GiB
 ./limewire-purge purge "${purge_common[@]}" "${purge_chain[@]}" --execute --concurrency 2 --qps 10
 ./limewire-purge verify "${purge_common[@]}" --qps 10
@@ -76,18 +77,18 @@ purge_chain=(
 |---|---|
 | 删除中断、网络错误、piece 重试耗尽 | 原 `purge … --execute` 重跑；自动领取当前任务未处理及失败项 |
 | 验收中断或 ERROR | 原 `verify …` 重跑，续验本代次未 PASS 的 OID |
-| 验收发现 RESIDUE | 原 `purge … --execute` 重清理，再 `verify …`；旧验收代次整体失效 |
+| 验收发现 RESIDUE | `purge … --execute --task-id N` 补删该批，再 `verify … --task-id N`；旧验收代次整体失效，不阻塞后续批次删除 |
 | SAFETY_HOLD | 查清原因后 `task resume … --reason '处理依据'`，再运行；不能绕过身份/名单/key 校验 |
 | 个别对象长期无法处理 | `task defer … --oid 123 --reason '原因与后续安排'`，继续处理其余对象，再 verify |
-| 后续处理延期项 | 当前任务完成后 `task create … --retry-deferred --target-size 500GiB` |
-| 重新完整验收历史任务 | 无其他未完成任务时 `verify … --task-id N --restart` |
+| 后续处理延期项 | 当前批删除结束后 `task create … --retry-deferred --target-size 500GiB`；不要求先验收原批次 |
+| 重新完整验收历史任务 | `verify … --task-id N --restart`；同库执行锁仍然互斥 |
 
 普通失败不用 `task resume`；旧 `--retry-failed` 参数仅兼容，已不再改变领取范围。
 `task defer` 只改变工具调度，不删数据、不更新冻结快照、不计 PASS；记录原因、时间并追加 `task_events`。
 某 OID 引发的安全暂停可通过明确延期该 OID 解除；全局或其他 OID 的安全暂停不能这样绕过。
 若冻结快照本身已改变，resume 仍会再次拦截；应先延期留账，再单独审核新的清理范围，不能手改库来“通过”校验。
 
-已完成任务禁止再次 purge。默认 verify 没有未完成任务时会提示指定历史 ID；显式查看已完成任务不会重跑检查，仅导出既有报告，重新检查必须加 `--restart`。
+已验收完成任务禁止直接再次 purge。默认 verify 没有删除完成的待验收任务时会报错；显式查看已完成任务只导出既有报告，重新检查必须加 `--restart`。旧批次 ERROR / RESIDUE 不阻塞新批次分配；若最早待验收批次仍失败，可用显式 ID 验收其他批次。
 
 ## 命令和数据边界
 
@@ -161,7 +162,7 @@ secondary 公式可逐字节复现 SP 的实际存储（本地 3+3 实测：5 Mi
 
 ### verify 独立验收
 
-仅验收本任务全部未延期 OID，不扫描其他任务。要求对象已处理成功；有未处理/失败项须先 purge 或人工 defer。
+每次仅验收一批全部未延期 OID，不扫描其他任务。默认按任务 ID 升序选最早待验收批次，也可显式指定。要求该批对象已处理成功；有未处理/失败项须先按 ID purge 或人工 defer。待验收不阻塞下一批删除，ALL_DONE 仍要求所有批次验收结束且无未解决延期项。
 对每个 OID 检查两个前缀是否为空（只需至多返回一个 key），以及本地元数据是否存在；无需再次列出数千个已删 key。
 
 逐 OID 记录 PASS / RESIDUE / ERROR 与验收代次。单个查询失败默认额外重试 3 次，仍失败记录 ERROR 并继续其他对象；不会被当成空。
@@ -178,7 +179,7 @@ verify 通过只说明配置范围内目标数据无残留，**不能证明未�
 | 状态 | 含义 / 恢复 |
 |---|---|
 | READY | 新任务未开始 |
-| RUNNING / VERIFYING | 当前有进程持执行锁，阶段为删除 / 验收 |
+| RUNNING / VERIFYING | 当前持锁连接匹配本任务 execution_connection_id，阶段为删除 / 验收 |
 | RETRY_PENDING | 无运行进程，仍有未处理或失败 OID；重跑 purge |
 | AWAITING_VERIFY | 已处理，尚未验收完成；运行 verify |
 | VERIFY_FAILED | 有残留或查询错误；按结果重跑 purge / verify |
@@ -186,13 +187,13 @@ verify 通过只说明配置范围内目标数据无残留，**不能证明未�
 | DONE | 当前代次全 PASS |
 | DONE_WITH_EXCEPTIONS | 其余对象全 PASS，但有单独留账的延期项 |
 
-RUNNING/VERIFYING 由执行锁结合阶段推导，不把崩溃前的运行标记当作永久占用。
+RUNNING/VERIFYING 由执行锁连接 ID 与任务阶段共同推导，不会把排队待验收的所有批次都标成运行中，也不把崩溃前标记当作永久占用。
 所有会写库的命令（含 verify、可选 dry-run 的 schema 检查）使用同一命名锁；status 不加锁。
 
 锁名包含进度库名摘要；不同 SP 的不同库不互相阻塞。通过专用 `sql.Conn` 持有 MySQL GET_LOCK，每 2 秒检查会话仍持锁，请求边界再次检查；失锁取消操作，不自动换连接重获。退出显式 RELEASE_LOCK。
 必须连接同一个 MySQL 写实例；它不是跨实例分布式锁，也不能撤回已发出的 S3 请求。不要在线复制进度库后并行清同一 SP。
 
-status 默认显示当前任务详情及总体汇总：已完成批数（含有延期项的批数）、未完成批数、未分配对象数、未解决延期数和当前锁连接；历史任务详情需传 `--task-id N`。只有 scan COMPLETE、扫描行数及名单对象数大于 0、至少一个已完成任务、无未分配/延期对象、无未完成任务且无执行锁时输出 ALL_DONE。
+status 默认展开当前待删除批次和所有待验收批次，另输出 stages：deletion_completed / deletion_pending / verification_completed / verification_pending。deletion_completed 是曾完成一轮删除的批次数，即使后来补删失败仍保留此里程碑；最终以逐批状态和验收为准。历史已验收任务需 `--task-id N` 查看。只有 scan COMPLETE、名单非空、至少一个验收完成任务、无未分配/延期对象、所有任务 done_at 有值且无执行锁才输出 ALL_DONE。ALL_DONE 仅为最终提示，不用于阻塞下一批。
 全局 `purge_progress done` 只是“处理成功”，不是“验收通过”；剩余数为零也不能单独证明成功。
 
 ### 任务绑定
@@ -224,7 +225,7 @@ status 默认显示当前任务详情及总体汇总：已完成批数（含有�
 |---|---|---|
 | task_meta | id=1；chain_id、sp_operator、storage、spdb、bucket_name、bucket_id；scan_status、scan_bsdb_count、scan_rows、scan_finished_at | 固定范围及全量扫描封存 |
 | scan_objects | object_id BIGINT UNSIGNED PK；payload_size BIGINT UNSIGNED、status VARCHAR(16)、version INT | 冻结 OID 快照，status 是链对象状态 |
-| purge_tasks | id BIGINT UNSIGNED 自增 PK；target_bytes、object_count、logical_bytes；digest CHAR(64)、phase；hold_reason、hold_oid；verify_generation、done_at | 子任务范围、阶段、安全暂停、验收代次、完成时间 |
+| purge_tasks | id BIGINT UNSIGNED 自增 PK；target_bytes、object_count、logical_bytes；digest CHAR(64)、phase；hold_reason、hold_oid；verify_generation、purged_at、done_at、execution_connection_id | 删除里程碑与验收完成时间分开；运行连接仅配合实时锁判断 |
 | task_objects | 联合 PK(task_id, object_id)，object_id 索引；deferred、defer_reason、deferred_at；verify_generation、verify_status、verify_detail、verified_at | 固定成员、人工延期、逐对象验收断点 |
 | purge_progress | object_id PK；status TINYINT（1处理成功/2失败）、deleted_keys INT UNSIGNED、deleted_bytes BIGINT UNSIGNED、fail_reason、role、expected_bytes、updated_at | 每 OID 最新处理结果及累计删除量 |
 | task_events | id 自增 PK；task_id、object_id（可空）、action、reason、created_at | DEFER / RESUME 人工决定留账；不是逐 key 删除审计 |
@@ -233,7 +234,7 @@ status 默认显示当前任务详情及总体汇总：已完成批数（含有�
 分配互斥由同库执行锁和创建事务保证；人工直接改表会破坏这些约束，不受支持。
 处理结果按 OID 累计，历史任务显示的删除统计可能随显式延期重试增加，不是逐任务尝试审计。
 
-旧库只有完整扫描、没有删除结果时可直接创建子任务；已有未分配到任务的旧删除结果时拒绝自动接管，使用新进度库或先单独审核迁移方案。不要通过手改 DONE/hold 字段绕过检查。
+旧库只有完整扫描、没有删除结果时可直接创建子任务；已有未分配到任务的旧删除结果时拒绝自动接管，使用新进度库或先单独审核迁移方案。升级后第一次正常写命令会在执行锁内自动补列，并为已处理完的旧批次补 purged_at，不会补写验收 PASS 或 done_at；status 只读，不负责升级表。不要通过手改 DONE/hold 字段绕过检查，也不要让旧版工具重新接管升级后的库。
 
 ## 2. 运行前提
 
@@ -329,7 +330,7 @@ IAMType = "AKSK"
 | --batch | scan | 5000，SQL 页大小 |
 | --target-size / --max-objects | task create | 500GiB / 10000，最大对象数允许 1..100000 |
 | --retry-deferred | task create | 默认关闭；显式处理延期池 |
-| --task-id | purge/verify/status/task defer/task resume | 默认当前任务；purge/defer/resume 传值必须匹配当前 ID；verify/status 可显式查历史 |
+| --task-id | purge/verify/status/task defer/task resume | purge 默认当前待删，显式 ID 可补删旧的未验收批次；verify 默认最早待验收；defer/resume 默认暂停→待删→待验收；status 可查历史 |
 | --oid / --reason | task defer | 必填；reason 为人工原因 |
 | --reason | task resume | 必填；不会修改冻结快照 |
 | --execute / --dry-run | purge | 二选一；真实删除必须 execute |

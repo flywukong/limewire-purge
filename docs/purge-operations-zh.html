@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Greenfield 数据清理操作手册 · 100G / 每批 10G</title>
+  <style>
+    :root{--ink:#18352f;--muted:#5b6b65;--green:#216c58;--pale:#eaf3ee;--line:#d5e0d9;--paper:#fff;--back:#f4f6f2;--amber:#9b4f15;--warn:#fff3e4}
+    *{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--back);color:var(--ink);font:16px/1.8 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
+    .wrap{max-width:1120px;margin:auto;padding:40px 34px 70px}header{border-top:6px solid var(--green);padding:34px 0 28px}.eyebrow{font-size:13px;letter-spacing:2px;color:var(--green);font-weight:700}h1{font-size:42px;line-height:1.25;margin:12px 0 18px;letter-spacing:-1px}h2{font-size:28px;line-height:1.45;margin:0 0 18px}h3{font-size:20px;margin:22px 0 10px}p{margin:10px 0}.lead{font-size:19px;max-width:880px;color:var(--muted)}.meta{font-size:13px;color:var(--muted)}a{color:var(--green);text-underline-offset:4px}nav{display:flex;gap:10px 24px;flex-wrap:wrap;padding:16px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}nav a{text-decoration:none;font-size:14px}
+    section{margin-top:42px;scroll-margin-top:20px}.num{font-size:15px;display:inline-grid;place-items:center;background:var(--green);color:white;width:35px;height:35px;margin-right:12px;border-radius:5px;vertical-align:4px}.box{padding:20px 24px;background:var(--paper);border:1px solid var(--line);border-radius:10px}.note{padding:16px 20px;background:var(--pale);border-left:4px solid var(--green);margin:18px 0}.warning{background:var(--warn);border-color:var(--amber)}.warning strong{color:var(--amber)}.small{font-size:14px;color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}.metric{font-size:32px;line-height:1.2;font-weight:700;margin:8px 0}.label{font-size:14px;color:var(--muted)}
+    .flow{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:22px;margin:22px 0}.node{position:relative;padding:20px;background:var(--pale);border-radius:8px}.node:not(:last-child):after{content:'→';position:absolute;right:-19px;top:28px;color:var(--green);font-size:22px}.node b{display:block;font-size:18px}.node span{display:block;font-size:14px;color:var(--muted);margin-top:5px}.loop{border:1px dashed var(--green);padding:12px 18px;text-align:center;border-radius:7px;font-size:15px;color:var(--green)}
+    table{border-collapse:collapse;width:100%;font-size:15px;margin:16px 0}th{text-align:left;background:var(--pale);font-size:14px}td,th{padding:13px 16px;border-bottom:1px solid var(--line);vertical-align:top}td:first-child{font-weight:600}code{font:0.9em/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#e9eeea;padding:2px 5px;border-radius:4px;overflow-wrap:anywhere}pre{margin:12px 0 18px;padding:20px 23px;background:#142d28;color:#ecf5f0;border-radius:8px;overflow:auto;tab-size:2;font:14px/1.75 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}pre code{background:none;padding:0;color:inherit;font:inherit;overflow-wrap:normal;white-space:pre}.cmd-label{font-size:13px;font-weight:700;color:var(--green);margin-top:18px}ul,ol{padding-left:24px;margin:10px 0}li{margin:7px 0}.step{border-left:2px solid var(--line);padding-left:24px;margin-top:26px}.rounds{display:grid;grid-template-columns:repeat(10,minmax(0,1fr));gap:7px;margin:20px 0}.rounds div{background:var(--pale);padding:10px 4px;border-radius:5px;text-align:center;font-size:12px}.rounds b{display:block;font-size:19px}.footer{border-top:1px solid var(--line);margin-top:44px;padding-top:20px;color:var(--muted);font-size:13px}.no-break{break-inside:avoid}.pill{display:inline-block;background:var(--pale);padding:2px 10px;border-radius:20px;font-size:13px}.table-wrap{overflow-x:auto}
+    @media(max-width:760px){.wrap{padding:22px 18px 45px}h1{font-size:31px}h2{font-size:23px}.grid{grid-template-columns:1fr}.metric{font-size:28px}.flow{grid-template-columns:1fr;gap:24px}.node:not(:last-child):after{content:'↓';right:auto;left:24px;top:auto;bottom:-27px}.rounds{grid-template-columns:repeat(5,1fr)}td,th{padding:10px}pre{font-size:12px;padding:15px}.step{padding-left:15px}.box{padding:16px}nav{gap:8px 16px}}
+    @media print{body{background:white;font-size:11pt}.wrap{max-width:none;padding:0}header{padding-top:15px}h1{font-size:29pt}h2{font-size:20pt}nav{display:none}section{margin-top:25px}pre{white-space:pre-wrap;overflow:visible;background:#f1f4f1;color:#18352f;border:1px solid #ccd5cf;font-size:9pt}pre code{white-space:pre-wrap;overflow-wrap:anywhere}.box,.note,.node,pre,table{break-inside:avoid}h2,h3,.cmd-label{break-after:avoid}.footer{font-size:9pt}a{color:inherit;text-decoration:none}}
+  </style>
+</head>
+<body>
+<main class="wrap">
+  <header>
+    <div class="eyebrow">GREENFIELD · LIMEWIRE-PURGE · 操作手册</div>
+    <h1>100G 数据，每批 10G<br>怎么安全地分批清理？</h1>
+    <p class="lead">先把全部对象名单扫描入库，再创建一批、删除一批。<strong>scan 只做一次，重复 task create → purge；verify 可以稍后单独逐批执行，不阻塞下一批删除。</strong></p>
+    <p class="meta">中文操作版 · 2026-10-13 · 已更新为删除 / 验收解耦工作流 · 命令示例，未执行任何删除</p>
+  </header>
+  <nav aria-label="章节导航"><a href="#example">容量与例子</a><a href="#prepare">执行前准备</a><a href="#scan">全量扫描</a><a href="#batch">第一批操作</a><a href="#repeat">后续批次</a><a href="#recover">失败续跑</a><a href="#finish">结束验收</a><a href="#status">命令分工与状态表</a></nav>
+
+  <div class="note warning"><strong>这是不可逆的物理删除。</strong> 工具清理 S3/MinIO piece 和本 SP 元数据，不发送链上 DeleteObject / Discontinue 交易，不停止链上计费，也不自动停 challenge。只能针对已授权的废弃数据；先在原 QA 环境完成小规模回归。</div>
+
+  <section id="example">
+    <h2><span class="num">01</span>先明确“100G / 10G”的意思</h2>
+    <div class="grid">
+      <div class="box"><div class="label">多个对象的逻辑总量</div><div class="metric">100 GiB</div><div class="small">以名单中 payload_size 的合计为准</div></div>
+      <div class="box"><div class="label">每个子任务目标</div><div class="metric">10 GiB</div><div class="small">命令：--target-size 10GiB</div></div>
+      <div class="box"><div class="label">预计子任务数量</div><div class="metric">约 10 批</div><div class="small">不是固定 10 次循环，以实际任务为准</div></div>
+    </div>
+    <p>本例统一使用 <strong>GiB</strong>：1 GiB = 1,073,741,824 字节。若你说的 10G 是十进制 <strong>10 GB</strong>，请改用 <code>--target-size 10000000000B</code>；工具不接受 <code>10G</code> 或 <code>10GB</code>。</p>
+    <div class="note warning"><strong>如果是一个 100G 的大文件，而不是多个文件共计 100G：</strong>工具不拆分一个 OID。即使目标设为 10GiB，这个超大对象也会独立组成一批，整对象处理；不能切成 10 个子任务。</div>
+    <ul>
+      <li><strong>10GiB 是近似任务容量，不是硬上限。</strong>按 OID 顺序选完整对象，最后一个普通对象可使容量略超；超大对象独立成批。</li>
+      <li><code>--max-objects 10000</code> 同时限制每批对象数。大量小对象可能先达到 10,000 个，任务不足 10GiB，批次数随之增加。</li>
+      <li><strong>逻辑容量 ≠ 本 SP 实际释放空间。</strong>primary 存完整段，secondary 存 EC 分片；不要拿本批 10GiB 直接对比云账单下降量。</li>
+      <li>每个 SP 各跑一份；每个 SP 使用自己的配置和独立进度库。<strong>不是每一批新建一个数据库。</strong></li>
+    </ul>
+    <h3>具体怎么选：10 个对象，每个 700MiB，目标 2GiB</h3>
+    <p>按 <strong>OID 从小到大</strong>选择未分配对象，累计 <code>payload_size</code> 达到或超过目标就停止；不拆对象，也不挑大小精确凑数。假设 OID 为 1～10，且未触发对象数上限：</p>
+    <table><thead><tr><th>子任务</th><th>选中 OID</th><th>逻辑容量</th></tr></thead><tbody>
+      <tr><td>1</td><td>1、2、3</td><td>2100MiB</td></tr>
+      <tr><td>2</td><td>4、5、6</td><td>2100MiB</td></tr>
+      <tr><td>3</td><td>7、8、9</td><td>2100MiB</td></tr>
+      <tr><td>4</td><td>10</td><td>700MiB</td></tr>
+    </tbody></table>
+    <p class="small"><code>--target-size 2GiB</code> = 2048MiB。前两个对象只有 1400MiB，所以继续加入第三个，到 2100MiB 后停止。每次 create 只创建其中一批；上一批删除成功后即可创建下一批，无需先验收。此例的 700M 明确按 700MiB 计算，实际按字节比较，不能混用 MB / MiB。</p>
+    <div class="flow" aria-label="分批清理流程">
+      <div class="node"><b>scan 一次</b><span>100GiB 的全部 OID<br>落库、对账、封存</span></div>
+      <div class="node"><b>create 一批</b><span>选约 10GiB<br>固定本批 OID 名单</span></div>
+      <div class="node"><b>purge 本批</b><span>成功后可创建下一批<br>purged_at 记录删除完成</span></div>
+      <div class="node"><b>verify 可后置</b><span>每次验最早待验收批次<br>通过后标记 DONE</span></div>
+    </div>
+    <div class="loop">本批删除成功 → 回到 task create；全部批次 verify 通过且无延期项 → ALL_DONE。普通验收失败不阻塞后续删除，安全暂停仍阻塞。<br>同一进度库仍串行执行命令，不同时运行 purge 和 verify。</div>
+  </section>
+
+  <section id="prepare">
+    <h2><span class="num">02</span>准备环境与公共参数</h2>
+    <ol>
+      <li>确认运行的是新版工具。在现有测试环境更新并构建，不需要重建集群或切换存储后端。</li>
+      <li>由运维确认 challenge / attestation 风险已在所需范围处置，并停止目标数据的上传、更新、迁移和恢复回写。仅停本地一个进程，不等于全网风险解除。</li>
+      <li>核对本 SP 的 config、物理桶、BSDB/SpDB 和链 RPC；确认 BSDB 已同步。准备另一个逻辑 bucket 的对照对象，保存内容摘要用于前后核对。</li>
+      <li>为本轮清理建一个<strong>空的独立 MySQL 进度库</strong>，例如 <code>limewire_purge_sp0_round1</code>。工具会建立所需表，但不会替你创建数据库；不要使用业务库、另一个 SP 的进度库或复用旧测试轮次的库。</li>
+    </ol>
+    <p>切换到工具所在目录。先通过现有安全方式设置以下变量；<strong>不要把密码或真实凭证写进本文档。</strong></p>
+    <div class="table-wrap"><table><thead><tr><th>变量</th><th>填写内容</th></tr></thead><tbody>
+      <tr><td>PURGE_CONFIG</td><td>本 SP 的 config.toml 绝对路径</td></tr>
+      <tr><td>PURGE_PROGRESS_DSN</td><td>本轮本 SP 的独立 MySQL 进度库 DSN，必须带库名</td></tr>
+      <tr><td>PURGE_BUCKET / PURGE_BUCKET_ID</td><td>授权清理的 Greenfield 逻辑 bucket 名称、链上数字 ID（不是 S3 桶名）</td></tr>
+      <tr><td>PURGE_CHAIN_RPC / PURGE_CHAIN_ID</td><td>该环境的 CometBFT RPC URL、chain ID；与 SP 配置一致，不使用主网默认值代替 QA 参数</td></tr>
+    </tbody></table></div>
+    <div class="cmd-label">在同一个 Bash / Zsh 终端设置公共参数</div>
+<pre><code>: "${PURGE_CONFIG:?请设置本 SP 配置路径}"
+: "${PURGE_PROGRESS_DSN:?请设置本轮独立进度库 DSN}"
+: "${PURGE_BUCKET:?请设置目标 bucket 名称}"
+: "${PURGE_BUCKET_ID:?请设置链上 bucket ID}"
+: "${PURGE_CHAIN_RPC:?请设置该环境链 RPC}"
+: "${PURGE_CHAIN_ID:?请设置该环境 chain ID}"
+
+purge_common=(
+  --config "$PURGE_CONFIG"
+  --progress-dsn "$PURGE_PROGRESS_DSN"
+  --bucket "$PURGE_BUCKET"
+  --bucket-id "$PURGE_BUCKET_ID"
+)
+purge_chain=(
+  --chain-rpc "$PURGE_CHAIN_RPC"
+  --chain-id "$PURGE_CHAIN_ID"
+)
+purge_storage=()
+set -o pipefail</code></pre>
+    <div class="note"><strong>如果原 QA 的物理桶处于 Suspended / Enabled：</strong>经确认接受历史版本不在清理范围后，执行下面这一行。后续 purge 和 verify 都会带上参数；否则保持空数组。</div>
+<pre><code>purge_storage=(--allow-versioned-bucket)</code></pre>
+    <p class="small">这个参数只恢复显式放行，不增加按 VersionId 删除。历史版本和删除标记可能仍存在；verify 通过不代表云端计费空间已全部释放。</p>
+  </section>
+
+  <section id="scan">
+    <h2><span class="num">03</span>全量扫描：整个 100GiB 只扫一次</h2>
+    <div class="step"><h3>先数对象，不写进度库</h3>
+<pre><code>./limewire-purge scan "${purge_common[@]}" --count-only</code></pre>
+      <p>计数应与测试名单相符。为 0 时先检查 bucket 名称/ID 和 BSDB 同步，不要继续；“0 个对象”不能当作清理已完成。</p>
+    </div>
+    <div class="step"><h3>确认后，全量入库并封存</h3>
+<pre><code>./limewire-purge scan "${purge_common[@]}" --batch 5000
+./limewire-purge status "${purge_common[@]}"</code></pre>
+      <p>预期：<code>scan status=COMPLETE</code>，对象数大于 0，<code>Σ payload_size</code> 约为 100GiB。<code>--batch 5000</code> 仅指数据库每页读取行数，<strong>不是删除子任务大小</strong>。</p>
+      <p>扫描失败可重跑 scan；封存成功后不再重复 scan。此后所有 10GiB 子任务都从这份名单分配。</p>
+    </div>
+  </section>
+
+  <section id="batch">
+    <h2><span class="num">04</span>第一批：创建约 10GiB → 删除；验收可后置</h2>
+    <p class="small">以下按已完成 QA 小规模验证的情况举例；首次回归建议先改成 1GiB、最多 2 个对象。命令分段执行，不要整页一次粘贴运行。</p>
+    <div class="step"><h3>A. 创建本批，人工核对摘要</h3>
+<pre><code>./limewire-purge task create "${purge_common[@]}" \
+  --target-size 10GiB --max-objects 10000
+
+./limewire-purge status "${purge_common[@]}"</code></pre>
+      <p>核对 <code>task=N</code>、<code>objects</code>、<code>logical_bytes</code> 和环境绑定。<strong>create 不删数据。</strong>如果已有首次删除未完成的任务，重复 create 返回它；只有待验收任务时，可以分配下一批。</p>
+    </div>
+    <div class="step"><h3>B. 确认本批范围后，正式删除</h3>
+      <p>为本次执行创建独立日志目录；重跑时也新建目录，避免覆盖上次错误证据。</p>
+<pre><code>purge_log_dir="./purge-logs/$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$purge_log_dir"
+
+./limewire-purge purge "${purge_common[@]}" \
+  "${purge_chain[@]}" "${purge_storage[@]}" \
+  --execute --concurrency 1 --qps 5 --max-retry 10 \
+  2&gt;&amp;1 | tee "$purge_log_dir/purge.log"</code></pre>
+      <p>只有 <code>--execute</code> 才真实删除。默认处理当前唯一待删除批次，不需要每次手记 ID。<code>--task-id N</code> 可固定已核对的批次，也可显式补删旧的未验收批次；已 DONE 的任务禁止直接 purge。不会自动选择旧批次补删。</p>
+      <div class="note warning"><strong>purge 报错就先停在这里。</strong>根据日志排障后重跑；不要直接创建下一批，也不要把“某些 key 已删除”当成本批完成。</div>
+    </div>
+    <div class="step"><h3>C. 独立验收：可现在做，也可删完多批再做</h3>
+      <p>本批 purge 成功后，就可以回到 A 创建下一批，不必先运行下面的 verify。默认 verify 每次只验收<strong>最早一批删除已完成、尚未验收完成的任务</strong>，不是最近一批；指定批次时加 <code>--task-id N</code>。小规模 QA 建议仍先验收再扩大。</p>
+<pre><code>./limewire-purge verify "${purge_common[@]}" \
+  "${purge_storage[@]}" --qps 5 \
+  2&gt;&amp;1 | tee "$purge_log_dir/verify.log"
+
+./limewire-purge status "${purge_common[@]}"</code></pre>
+      <p>verify 检查选中批次的 <code>s&lt;oid&gt;_</code>、<code>e&lt;oid&gt;_</code> 及本地元数据，默认报告为 <code>residue-task-ID.tsv</code>。成功退出并打印 <code>state=DONE</code> 后，验收完成批数增加；其他待删除 / 待验收任务仍保留。每次执行前可新建日志目录避免覆盖日志。</p>
+      <p><code>DONE_WITH_EXCEPTIONS</code> 表示有人工延期对象，不等于全部清干净。没有延期项的正常流程才按下面的“约 10 批”继续。<strong>status 只展示已记录的结果，不能代替 verify 的实际复查。</strong>完整判断规则见<a href="#status">命令分工与状态表</a>。</p>
+    </div>
+  </section>
+
+  <section id="repeat">
+    <h2><span class="num">05</span>剩余 90GiB：重复同一套命令</h2>
+    <p>第一批 purge 成功后，重复第 04 节 <strong>A → B</strong>，即可推进后续删除。C（verify）可以逐批做，也可以等多批删除后再做；每次默认验收最早待验收批次。仍使用同一份配置、同一个进度库，<strong>不再 scan、不新建子数据库、不手工挑 OID</strong>。</p>
+    <div class="rounds" aria-label="约十批示意，不是实时进度">
+      <div>第 1 批<b>10</b>GiB</div><div>第 2 批<b>10</b>GiB</div><div>第 3 批<b>10</b>GiB</div><div>第 4 批<b>10</b>GiB</div><div>第 5 批<b>10</b>GiB</div><div>第 6 批<b>10</b>GiB</div><div>第 7 批<b>10</b>GiB</div><div>第 8 批<b>10</b>GiB</div><div>第 9 批<b>10</b>GiB</div><div>第 10 批<b>10</b>GiB</div>
+    </div>
+    <p class="small">以上仅示意：假设对象恰好能组成 10GiB 一批。真实容量、批次数及最后一批大小，以工具输出为准。</p>
+    <table><thead><tr><th>阶段</th><th>做什么</th><th>成功后</th></tr></thead><tbody>
+      <tr><td>第一次</td><td>scan 全部约 100GiB 名单</td><td>名单 COMPLETE，尚未删除</td></tr>
+      <tr><td>第 1 批</td><td>create 10GiB → purge</td><td>约 10GiB 的删除处理结束，待验收</td></tr>
+      <tr><td>第 2～9 批</td><td>每批重复 create → purge</td><td>上一批删除成功即可推进，不等验收</td></tr>
+      <tr><td>最后一批</td><td>仍用 --target-size 10GiB，自动选剩余对象</td><td>剩余不足 10GiB 也可创建；删完不等于 ALL_DONE</td></tr>
+      <tr><td>独立验收</td><td>逐次执行 verify，每次处理最早待验收批次</td><td>全部验收通过且无延期 / 未分配项，最终才 ALL_DONE</td></tr>
+    </tbody></table>
+    <div class="note"><strong>不要写死“循环 10 次”。</strong>容量是近似值，还有对象数上限和超大对象。按 status 的未分配数与验收结果推进；create 提示“无未分配对象”时，再检查延期池和最终状态，而不是仅凭这条提示结束。</div>
+  </section>
+
+  <section id="recover">
+    <h2><span class="num">06</span>失败了，怎么接着跑？</h2>
+    <div class="table-wrap"><table><thead><tr><th>看到什么</th><th>下一步操作</th></tr></thead><tbody>
+      <tr><td>purge：!!! STOP</td><td>查看 task、OID、错误原因。普通失败停止新对象，等待在途对象完成或失败并尽量落库。排障后重跑第 04-B 节的 purge 命令；不需 task resume。</td></tr>
+      <tr><td>Ctrl+C / 进程退出</td><td>确认旧进程已退出；使用原进度库、原当前任务重跑 purge。已完成项跳过，失败/未完成项按实际残留继续。</td></tr>
+      <tr><td>verify：ERROR / 中断</td><td>排障后重跑 verify。当前实现会记录普通查询错误并继续验收；下一次跳过本代次已 PASS 的项。</td></tr>
+      <tr><td>verify：RESIDUE</td><td>用 purge --execute --task-id N 补删该批，再 verify --task-id N；旧验收代次失效，整批重验。不阻塞后续批次分配，不能用默认 purge 误选下一批。</td></tr>
+      <tr><td>SAFETY_HOLD</td><td>身份、名单或 key 安全异常。任一批暂停都会阻止继续创建和删除；核对后 task resume --task-id N 写明依据。后续仍会重新检查，不能靠切换批次绕过。</td></tr>
+      <tr><td>同一 OID 长期失败</td><td>先查原因，不要反复盲跑。必要时人工 task defer，记录原因和后续安排；该项不计 PASS，留在延期池。</td></tr>
+    </tbody></table></div>
+    <p><strong>重试边界：</strong>piece 默认首次尝试 + 10 次重试；链查询、SpDB 临时错误最多 3 次应用层尝试，间隔 1 秒/2 秒。权限等永久错误不盲目重试。普通失败收尾可能较久；安全异常、失锁、Ctrl+C 仍立即取消。</p>
+    <details>
+      <summary>特殊情况命令：解除安全暂停 / 延期 / 重新处理延期项</summary>
+      <p>仅在查明原因并获得相应操作确认后使用。示例 OID 123 必须换成实际目标；不适用于普通网络失败。</p>
+<pre><code># 仅用于确有安全暂停、且已查清处理依据的任务
+./limewire-purge task resume "${purge_common[@]}" \
+  --reason '填写实际排查结果和恢复依据'
+
+# 延期一个确实暂时无法处理的对象：不删除、不算 PASS
+./limewire-purge task defer "${purge_common[@]}" --oid 123 \
+  --reason '填写失败原因、延期依据和后续安排'
+
+# 当前批删除处理结束后，即可显式创建任务处理延期池（不必等原批验收）
+./limewire-purge task create "${purge_common[@]}" \
+  --retry-deferred --target-size 10GiB --max-objects 10000</code></pre>
+    </details>
+  </section>
+
+  <section id="finish">
+    <h2><span class="num">07</span>什么情况下可以说“本 SP 清理完成”？</h2>
+    <div class="box">
+      <p><span class="pill">最终检查</span></p>
+<pre><code>./limewire-purge status "${purge_common[@]}"</code></pre>
+      <ul>
+        <li>扫描名单 COMPLETE 且非空，至少有一个已完成任务。</li>
+        <li><code>unassigned=0</code>、<code>deferred_unresolved=0</code>，没有未完成任务和执行锁。</li>
+        <li>status 打印 <code>ALL_DONE</code>；检查另一个 bucket 的对照对象仍可读取且内容摘要一致。</li>
+        <li>保留代码版本、任务摘要、每批日志和 verify 报告；不要把凭证放进验收材料。</li>
+      </ul>
+    </div>
+    <div class="note warning"><strong>完成范围仅限本次配置的本 SP 物理桶与本地元数据。</strong>其他 SP 要分别执行和验收；开启显式版本桶放行时，历史版本不在范围内。verify 能证明目标当前数据无残留，不能单独证明没有误删其他数据，也不代表链上对象已删除或停止计费。不要因为工具结束就直接恢复挑战服务。</div>
+  </section>
+  <section id="status">
+    <h2><span class="num">08</span>purge、verify、status 分别做什么？</h2>
+    <table><thead><tr><th>命令</th><th>实际动作</th><th>结果</th></tr></thead><tbody>
+      <tr><td>purge</td><td>检查链上归属与对象快照，删除物理数据和本地元数据</td><td>逐 OID 记录结果；本批删除成功记 purged_at，允许下一批；不等于验收通过</td></tr>
+      <tr><td>verify</td><td>实际访问存储与 SpDB，重新检查两个前缀和本地元数据是否残留</td><td>记录 PASS / RESIDUE / ERROR；满足条件后结束本批</td></tr>
+      <tr><td>status</td><td>只查询进度库及 MySQL 执行锁，不查链、不扫描 S3</td><td>显示当前进度和已保存的验收结论，不产生新的验收结果</td></tr>
+    </tbody></table>
+    <div class="note"><strong>purge 可逐批往前推进，verify 可以稍后逐批复查，status 只查询结果。</strong>ALL_DONE 仅用于最终收尾，不是下一批删除的门槛；不必每批反复执行 status。</div>
+    <p class="small">status 不是新命令：第一版 <code>bba4983</code> 已有；<code>9beec7b</code> 子任务改造增加了子任务状态、延期池及 ALL_DONE 判断。</p>
+
+    <h3>判断依据：本 SP 的独立进度库</h3>
+    <p>以下表均位于 <code>--progress-dsn</code> 指定的数据库，不是业务 BSDB / SpDB 的原始表。</p>
+    <div class="table-wrap"><table><thead><tr><th>表</th><th>关键字段 / 用途</th></tr></thead><tbody>
+      <tr><td>task_meta</td><td>环境绑定、scan_status、scan_rows：整份名单是否已扫描并封存</td></tr>
+      <tr><td>scan_objects</td><td>全量 OID、payload_size、链上状态和版本快照：名单总量及未分配对象。这里的 status 不是删除进度</td></tr>
+      <tr><td>purge_tasks</td><td>phase、hold_reason、purged_at、done_at、verify_generation、execution_connection_id：阶段、安全暂停、删除里程碑、验收完成时间、代次及执行连接</td></tr>
+      <tr><td>task_objects</td><td>task_id + object_id、deferred、verify_status、verify_generation：本批名单、延期和逐对象验收结果</td></tr>
+      <tr><td>purge_progress</td><td>每个 OID 的删除结果：status=1 成功、status=2 失败，无记录表示尚未处理；另存删除数量、字节数和失败原因</td></tr>
+      <tr><td>task_events</td><td>人工恢复、延期等审计记录，不直接决定展示状态</td></tr>
+    </tbody></table></div>
+
+    <h3>子任务状态：按下表从上往下判断，先命中先返回</h3>
+    <div class="table-wrap"><table><thead><tr><th>展示状态</th><th>代码判断条件</th><th>操作含义</th></tr></thead><tbody>
+      <tr><td>SAFETY_HOLD</td><td>purge_tasks.hold_reason 非空</td><td>安全暂停，先排查原因</td></tr>
+      <tr><td>DONE_WITH_EXCEPTIONS</td><td>done_at 已填写，且本批存在延期对象</td><td>本批结束，但延期项未算 PASS</td></tr>
+      <tr><td>DONE</td><td>done_at 已填写，且无延期对象</td><td>本批验收完成；下一批不必等到此状态</td></tr>
+      <tr><td>READY</td><td>phase='READY'</td><td>任务已创建，尚未进入执行阶段</td></tr>
+      <tr><td>VERIFYING</td><td>本任务 execution_connection_id 匹配实时执行锁，且 phase='VERIFY'</td><td>仅该批次显示验收中</td></tr>
+      <tr><td>RUNNING</td><td>本任务连接匹配实时执行锁，且未命中以上条件</td><td>执行中；不代表处理数量一定在增长</td></tr>
+      <tr><td>VERIFY_FAILED</td><td>本批未运行，本代次存在非延期对象的 RESIDUE 或 ERROR</td><td>按 ID 补删或重验，不阻塞后续删除</td></tr>
+      <tr><td>RETRY_PENDING</td><td>本批未运行，存在非延期对象尚未处理或删除失败</td><td>排障后重跑；旧批次补删失败用显式 ID</td></tr>
+      <tr><td>AWAITING_VERIFY</td><td>以上均未命中：删除已处理，但 done_at 尚未填写</td><td>执行或继续 verify</td></tr>
+    </tbody></table></div>
+    <p class="small">对象统计由 task_objects 关联 purge_tasks 和 purge_progress 得出。MySQL <code>IS_USED_LOCK()</code> 返回的连接必须匹配该任务记录的连接，才算本批运行；不能把所有排队批次都标为运行中。多次查询不是原子快照，显示可能短暂变化。</p>
+
+    <h3>什么时候写入 done_at？</h3>
+    <p>verify 收尾时要求：任务成员数与冻结数量一致、非延期对象无未处理或删除失败项，且<strong>本代次 PASS 数 + 延期数 = 本批总数</strong>。任务还必须没有安全暂停、处于对应验收阶段，才写入 <code>purge_tasks.done_at</code>。</p>
+    <p><code>purge_progress.status=1</code> 是逐对象删除成功；<code>purged_at</code> 是整批删除里程碑，允许下一批；<code>done_at</code> 才是本批验收结束。旧批次补删保留 purged_at，不重新阻塞新批，但会使旧验收失效，必须重新验收。</p>
+    <p class="small">升级已有进度库：第一次正常写命令在持锁时自动补列，并为已处理完的旧批次补 purged_at，不补写 PASS / done_at。status 只读，不执行表升级；不要混用新旧二进制操作同一进度库。</p>
+
+    <h3>ALL_DONE 是全局汇总，不是单个任务的状态字段</h3>
+    <p>默认 status 同时满足以下条件才打印 ALL_DONE：名单已绑定、扫描 COMPLETE 且非空、至少有一个完成子任务、未分配数为 0、未解决延期数为 0、无未完成子任务、无执行锁。这是<strong>数据库中已记录的完成结论</strong>，不是当场重新检查 S3。</p>
+    <p>status 默认展开当前待删除批次和所有待验收批次；stages 分别统计 deletion_completed / deletion_pending / verification_completed / verification_pending。删除完成数是历史里程碑，不代表补删也已成功。历史已验收任务体现在汇总计数中；查看某一批的 DONE 时指定 ID：</p>
+<pre><code># 整体进度：当前任务、完成批数、未分配 / 延期池、ALL_DONE
+./limewire-purge status "${purge_common[@]}"
+
+# 查看某一批历史任务；把 1 替换为实际任务 ID
+./limewire-purge status "${purge_common[@]}" --task-id 1</code></pre>
+    <p class="small">代码依据：internal/progress/subtask.go（State、SubCounts、CompleteVerify）、internal/progress/progress.go（表结构）、cmd/limewire-purge/main.go（runStatus）。</p>
+  </section>
+  <footer class="footer">操作依据：limewire-purge README、TESTING 和当前 CLI。本文是离线说明文档，无外部依赖、不会执行命令或连接环境。此处的 100GiB / 10GiB 是容量示例，不是环境实测结果。</footer>
+</main>
+</body>
+</html>

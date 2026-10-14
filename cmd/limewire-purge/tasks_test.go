@@ -57,6 +57,29 @@ func TestTaskLogIncludesSummaryAndWorkerContext(t *testing.T) {
 	}
 }
 
+func TestAllDoneStillRequiresEveryTaskVerified(t *testing.T) {
+	scan := progress.Task{ScanStatus: progress.ScanComplete, ScanRows: sql.NullInt64{Int64: 100, Valid: true}}
+	for _, tc := range []struct {
+		name                 string
+		verified, unfinished int
+		unassigned, deferred uint64
+		locked, want         bool
+	}{
+		{"all deleted, none verified", 0, 10, 0, 0, false, false},
+		{"one verified, nine pending", 1, 9, 0, 0, false, false},
+		{"all verified", 10, 0, 0, 0, false, true},
+		{"deferred pool", 10, 0, 0, 1, false, false},
+		{"unassigned", 10, 0, 1, 0, false, false},
+		{"command still running", 10, 0, 0, 0, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := allDone(scan, 100, tc.verified, tc.unassigned, tc.deferred, tc.unfinished, tc.locked); got != tc.want {
+				t.Fatalf("got %v want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestTaskErrorRetainsIdentityAndCause(t *testing.T) {
 	cause := errors.New("request failed")
 	err := withTaskError(7, cause)

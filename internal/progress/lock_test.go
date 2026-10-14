@@ -18,6 +18,7 @@ type lockServer struct {
 	mu     sync.Mutex
 	next   int64
 	owners map[string]int64
+	query  func(string, []driver.NamedValue) (driver.Rows, error)
 }
 type lockConnector struct {
 	s        *lockServer
@@ -67,6 +68,9 @@ func (c *lockConn) QueryContext(ctx context.Context, q string, args []driver.Nam
 	case q == "SELECT DATABASE()":
 		values = []driver.Value{c.database}
 	default:
+		if !strings.Contains(q, "GET_LOCK") && !strings.Contains(q, "IS_USED_LOCK") && !strings.Contains(q, "RELEASE_LOCK") && c.s.query != nil {
+			return c.s.query(q, args)
+		}
 		name := args[0].Value.(string)
 		owner := c.s.owners[name]
 		switch {

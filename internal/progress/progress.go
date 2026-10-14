@@ -109,6 +109,7 @@ func (p *DB) EnsureSchema(ctx context.Context) error {
 		 phase VARCHAR(16) NOT NULL DEFAULT 'READY',
 		 hold_reason VARCHAR(4000) NOT NULL DEFAULT '', hold_oid BIGINT UNSIGNED NULL,
 		 verify_generation BIGINT UNSIGNED NOT NULL DEFAULT 1,
+		 purged_at TIMESTAMP NULL, execution_connection_id BIGINT UNSIGNED NULL,
 		 done_at TIMESTAMP NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 		) ENGINE=InnoDB`,
 		`CREATE TABLE IF NOT EXISTS task_objects (
@@ -134,13 +135,15 @@ func (p *DB) EnsureSchema(ctx context.Context) error {
 	}
 	// columns added after the first release; progress databases created by an
 	// older binary get them added in place
-	for _, col := range []struct{ name, ddl string }{
-		{"role", "ALTER TABLE purge_progress ADD COLUMN role VARCHAR(10) NULL"},
-		{"expected_bytes", "ALTER TABLE purge_progress ADD COLUMN expected_bytes BIGINT UNSIGNED NULL"},
+	for _, col := range []struct{ table, name, ddl string }{
+		{"purge_progress", "role", "ALTER TABLE purge_progress ADD COLUMN role VARCHAR(10) NULL"},
+		{"purge_progress", "expected_bytes", "ALTER TABLE purge_progress ADD COLUMN expected_bytes BIGINT UNSIGNED NULL"},
+		{"purge_tasks", "purged_at", "ALTER TABLE purge_tasks ADD COLUMN purged_at TIMESTAMP NULL"},
+		{"purge_tasks", "execution_connection_id", "ALTER TABLE purge_tasks ADD COLUMN execution_connection_id BIGINT UNSIGNED NULL"},
 	} {
 		var n int
 		if err := p.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM information_schema.columns
-			WHERE table_schema = DATABASE() AND table_name = 'purge_progress' AND column_name = ?`, col.name).Scan(&n); err != nil {
+			WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?`, col.table, col.name).Scan(&n); err != nil {
 			return err
 		}
 		if n == 0 {
@@ -159,7 +162,19 @@ func (p *DB) EnsureSchema(ctx context.Context) error {
 	if nonTransactional != 0 {
 		return fmt.Errorf("progress tables must use InnoDB; review/migrate storage engines before running")
 	}
-	return nil
+	// A new command owns the lock: do not attribute it to a previous task.
+	if _, err := p.db.ExecContext(ctx, `UPDATE purge_tasks SET execution_connection_id=NULL WHERE execution_connection_id IS NOT NULL`); err != nil {
+		return err
+	}
+	// Upgrade old databases, and recover a crash after the last per-object write.
+	// This never marks verification DONE or erases an existing safety hold.
+	_, err := p.db.ExecContext(ctx, `UPDATE purge_tasks t SET purged_at=COALESCE(done_at,CURRENT_TIMESTAMP)
+ WHERE purged_at IS NULL AND hold_reason='' AND object_count>0
+ AND (phase<>'READY' OR NOT EXISTS (SELECT 1 FROM task_objects active WHERE active.task_id=t.id AND active.deferred=0))
+ AND object_count=(SELECT COUNT(*) FROM task_objects o WHERE o.task_id=t.id)
+ AND NOT EXISTS (SELECT 1 FROM task_objects o LEFT JOIN purge_progress p ON p.object_id=o.object_id
+ WHERE o.task_id=t.id AND o.deferred=0 AND (p.object_id IS NULL OR p.status<>1))`)
+	return err
 }
 
 // ScanRow is what scan pulls out of bsdb for one object.

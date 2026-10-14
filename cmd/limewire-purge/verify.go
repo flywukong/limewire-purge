@@ -23,7 +23,7 @@ func runVerify(ctx context.Context, args []string) (retErr error) {
 	fs := flag.NewFlagSet("verify", flag.ContinueOnError)
 	var c common
 	addCommon(fs, &c)
-	id := fs.Uint64("task-id", 0, "subtask id; default: sole unfinished task")
+	id := fs.Uint64("task-id", 0, "subtask id; default: oldest deletion-complete task awaiting verification (one task per invocation)")
 	restart := fs.Bool("restart", false, "start a fresh verification generation; recheck every nondeferred OID")
 	allowVersioned := fs.Bool("allow-versioned-bucket", false, "explicitly allow Enabled/Suspended buckets; a clean result does not prove historical versions or delete markers are removed")
 	out := fs.String("out", "", "report path (default: residue-task-ID.tsv); overwritten atomically")
@@ -48,9 +48,9 @@ func runVerify(ctx context.Context, args []string) (retErr error) {
 		return err
 	}
 	defer pg.Close()
-	s, err := pg.ResolveSubtask(ctx, *id)
+	s, err := pg.ResolveVerifySubtask(ctx, *id)
 	if err != nil {
-		if errors.Is(err, progress.ErrNoCurrentTask) {
+		if errors.Is(err, progress.ErrNoVerifyTask) {
 			return fmt.Errorf("没有待验收的任务 (no task awaiting verification); to recheck history use --task-id N --restart: %w", err)
 		}
 		return err

@@ -284,7 +284,7 @@ func runPurge(ctx context.Context, args []string) (retErr error) {
 	fs := flag.NewFlagSet("purge", flag.ContinueOnError)
 	var c common
 	addCommon(fs, &c)
-	taskID := fs.Uint64("task-id", 0, "optional expectation: must match the current unfinished task")
+	taskID := fs.Uint64("task-id", 0, "default: current deletion task; explicit ID may also repair a deletion-complete, unverified task")
 	execute := fs.Bool("execute", false, "confirm real deletion within the selected task")
 	chainRPC := fs.String("chain-rpc", "https://greenfield-chain.bnbchain.org:443", "chain CometBFT RPC URL (with scheme); local e.g. http://localhost:26657")
 	chainID := fs.String("chain-id", "greenfield_1017-1", "chain id, e.g. greenfield_1017-1 (mainnet) or greenfield_9000-121 (local)")
@@ -326,7 +326,7 @@ func runPurge(ctx context.Context, args []string) (retErr error) {
 		return err
 	}
 	defer pg.Close()
-	task, err := pg.ResolveCurrentSubtask(ctx, *taskID)
+	task, err := pg.ResolvePurgeSubtask(ctx, *taskID)
 	if err != nil {
 		return err
 	}
@@ -422,7 +422,10 @@ func runPurge(ctx context.Context, args []string) (retErr error) {
 	if left.Pending+left.Failed > 0 {
 		return fmt.Errorf("task=%d still has %d pending and %d failed objects; rerun purge", task.ID, left.Pending, left.Failed)
 	}
-	log.Printf("task=%d deletion pass finished; run verify separately before creating another task", task.ID)
+	if err := pg.CompletePurge(ctx, task); err != nil {
+		return err
+	}
+	log.Printf("task=%d deletion pass finished; next task may now be created; verification remains pending (verify --task-id %d)", task.ID, task.ID)
 	return nil
 }
 
@@ -511,8 +514,16 @@ func runStatus(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	var unfinished, completed, exceptions int
+	var unfinished, completed, exceptions, deletionComplete, deletionPending, awaitingVerify int
 	for _, s := range tasks {
+		if s.PurgedAt.Valid {
+			deletionComplete++
+			if !s.DoneAt.Valid {
+				awaitingVerify++
+			}
+		} else if !s.DoneAt.Valid {
+			deletionPending++
+		}
 		if s.DoneAt.Valid {
 			completed++
 			c, err := pg.SubCounts(ctx, s.ID)
@@ -527,6 +538,7 @@ func runStatus(ctx context.Context, args []string) error {
 		}
 	}
 	fmt.Printf("subtasks  completed=%d (with_exceptions=%d) unfinished=%d\n", completed, exceptions, unfinished)
+	fmt.Printf("stages    deletion_completed=%d deletion_pending=%d verification_completed=%d verification_pending=%d\n", deletionComplete, deletionPending, completed, awaitingVerify)
 	if *taskID != 0 {
 		s, err := pg.Subtask(ctx, *taskID)
 		if err != nil {
@@ -534,17 +546,17 @@ func runStatus(ctx context.Context, args []string) error {
 		}
 		tasks = []progress.Subtask{s}
 	}
-	if *taskID == 0 && unfinished == 0 {
-		fmt.Println("current   none (no unfinished task)")
+	if *taskID == 0 && deletionPending == 0 {
+		fmt.Println("current   none (no pending deletion task; verification may still be pending)")
 	}
 	for _, s := range tasks {
 		if *taskID == 0 && s.DoneAt.Valid {
 			continue
 		}
-		if !s.DoneAt.Valid {
+		if !s.DoneAt.Valid && !s.PurgedAt.Valid {
 			fmt.Printf("current   task=%d\n", s.ID)
 		}
-		if err := printSubtask(ctx, pg, s, owner.Valid); err != nil {
+		if err := printSubtask(ctx, pg, s, s.LockedBy(owner)); err != nil {
 			return err
 		}
 		rows, err := pg.VerifyReport(ctx, s)
@@ -563,7 +575,7 @@ func runStatus(ctx context.Context, args []string) error {
 		return err
 	}
 	fmt.Printf("pool      unassigned=%d deferred_unresolved=%d\n", unassigned, deferred)
-	if *taskID == 0 && bound && completedNonEmptyScan(t, completed) && cnt.Total > 0 && unassigned == 0 && deferred == 0 && unfinished == 0 && !owner.Valid {
+	if *taskID == 0 && bound && allDone(t, cnt.Total, completed, unassigned, deferred, unfinished, owner.Valid) {
 		fmt.Println("ALL_DONE: every assigned object verified; no unassigned or deferred objects")
 	}
 	if bound && t.ScanStatus == progress.ScanComplete && (!t.ScanRows.Valid || t.ScanRows.Int64 <= 0 || cnt.Total == 0) {
@@ -576,6 +588,10 @@ func runStatus(ctx context.Context, args []string) error {
 // a manifest without any completed subtask is evidence of completed cleanup.
 func completedNonEmptyScan(t progress.Task, completed int) bool {
 	return t.ScanStatus == progress.ScanComplete && t.ScanRows.Valid && t.ScanRows.Int64 > 0 && completed > 0
+}
+
+func allDone(t progress.Task, total uint64, verified int, unassigned, deferred uint64, unfinished int, locked bool) bool {
+	return completedNonEmptyScan(t, verified) && total > 0 && unassigned == 0 && deferred == 0 && unfinished == 0 && !locked
 }
 
 func nullInt(v sql.NullInt64) string {

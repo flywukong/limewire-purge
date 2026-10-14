@@ -56,7 +56,7 @@ func runTask(ctx context.Context, args []string) (retErr error) {
 		fs.IntVar(&max, "max-objects", 10000, "maximum OIDs in a task (1..100000)")
 		fs.BoolVar(&deferred, "retry-deferred", false, "explicitly allocate from the deferred pool, retaining history")
 	default:
-		fs.Uint64Var(&id, "task-id", 0, "optional expectation: must match the current unfinished task")
+		fs.Uint64Var(&id, "task-id", 0, "task to administer; default: held task, current deletion task, then oldest unverified task")
 		fs.StringVar(&reason, "reason", "", "required operator explanation, recorded in task_events")
 		if action == "defer" {
 			fs.Uint64Var(&oid, "oid", 0, "object to defer; not marked PASS")
@@ -90,7 +90,7 @@ func runTask(ctx context.Context, args []string) (retErr error) {
 		defer beginTaskLog("task create", s)()
 		defer func() { retErr = withTaskError(s.ID, retErr) }()
 	} else {
-		s, err = pg.ResolveCurrentSubtask(ctx, id)
+		s, err = pg.ResolveAdminSubtask(ctx, id)
 		if err != nil {
 			return err
 		}
@@ -122,8 +122,8 @@ func printSubtask(ctx context.Context, pg *progress.DB, s progress.Subtask, lock
 	if err != nil {
 		return err
 	}
-	fmt.Printf("task=%d state=%s objects=%d logical_bytes=%d processed=%d pending=%d failed=%d deferred=%d verify_pass=%d residue=%d verify_errors=%d generation=%d\n",
-		s.ID, s.State(c, locked), s.ObjectCount, s.LogicalBytes, c.Processed, c.Pending, c.Failed, c.Deferred, c.Verified, c.Residue, c.VerifyErrors, s.Generation)
+	fmt.Printf("task=%d state=%s objects=%d logical_bytes=%d processed=%d pending=%d failed=%d deferred=%d verify_pass=%d residue=%d verify_errors=%d generation=%d deletion_completed=%v\n",
+		s.ID, s.State(c, locked), s.ObjectCount, s.LogicalBytes, c.Processed, c.Pending, c.Failed, c.Deferred, c.Verified, c.Residue, c.VerifyErrors, s.Generation, s.PurgedAt.Valid)
 	if s.HoldReason != "" {
 		fmt.Printf("  safety_hold oid=%s reason=%s\n", nullInt(s.HoldOID), s.HoldReason)
 	}
