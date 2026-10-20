@@ -16,7 +16,6 @@ import (
 
 	"limewire-purge/internal/pieceop"
 	"limewire-purge/internal/s3store"
-	"limewire-purge/internal/spdb"
 )
 
 // ObjectStore is the object-storage side: list by prefix, delete a batch.
@@ -48,12 +47,6 @@ type ObjectHead struct {
 // Chain is the pre-delete identity check.
 type Chain interface {
 	HeadObject(ctx context.Context, oid uint64) (ObjectHead, error)
-}
-
-// Meta is the SP's local metadata database.
-type Meta interface {
-	Delete(ctx context.Context, oid uint64) error
-	Exists(ctx context.Context, oid uint64) (bool, error)
 }
 
 // Claimed is one object handed to a worker, with the snapshot scan recorded for
@@ -89,7 +82,6 @@ type Options struct {
 type Runner struct {
 	Store    ObjectStore
 	Chain    Chain
-	Meta     Meta
 	Progress Progress
 	Opt      Options
 	// Check runs at request boundaries; OnSafety durably latches the task hold.
@@ -437,7 +429,8 @@ func (r *Runner) verdict(oid uint64, res Result, check SizeCheck, payload uint64
 }
 
 // ProcessOne runs the full sequence for a single object:
-// chain check → delete both prefixes until empty → re-check empty → clear metadata.
+// chain check → delete both prefixes until empty → re-check empty. The SP's own
+// metadata (SpDB integrity_meta / piece_hash) is never touched.
 // Intermediate state lives only in the returned counters.
 func (r *Runner) ProcessOne(ctx context.Context, c Claimed) Result {
 	var res Result
@@ -495,43 +488,6 @@ func (r *Runner) ProcessOne(ctx context.Context, c Claimed) Result {
 			res.Err = fmt.Errorf("re-check %s: residue", prefix)
 			return res
 		}
-	}
-
-	// ⑤ local metadata
-	if r.Check != nil {
-		if err := r.Check(ctx); err != nil {
-			res.Err = err
-			return res
-		}
-	}
-	if err := spdb.Retry(ctx, fmt.Sprintf("oid=%d metadata delete", oid), func(cctx context.Context) error {
-		if r.Check != nil {
-			if err := r.Check(cctx); err != nil {
-				return err
-			}
-		}
-		return r.Meta.Delete(cctx, oid)
-	}); err != nil {
-		res.Err = fmt.Errorf("metadata delete: %w", err)
-		return res
-	}
-	var exists bool
-	err = spdb.Retry(ctx, fmt.Sprintf("oid=%d metadata re-check", oid), func(cctx context.Context) error {
-		if r.Check != nil {
-			if err := r.Check(cctx); err != nil {
-				return err
-			}
-		}
-		var e error
-		exists, e = r.Meta.Exists(cctx, oid)
-		return e
-	})
-	if err != nil {
-		res.Err = fmt.Errorf("metadata re-check: %w", err)
-		return res
-	}
-	if exists {
-		res.Err = errors.New("metadata re-check: rows still present")
 	}
 	return res
 }

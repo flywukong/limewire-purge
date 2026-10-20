@@ -3,7 +3,7 @@
 //
 //	scan    pull the bucket's object ids out of the SP's bsdb into scan_objects
 //	task    allocate capacity-bounded subtasks; explicitly defer/resume
-//	purge   process the selected subtask (chain check → prefix delete → metadata)
+//	purge   process the selected subtask (chain check → prefix delete → re-check)
 //	verify  independently check the subtask, persist verification checkpoints
 //	status  print counts
 package main
@@ -26,7 +26,6 @@ import (
 	"limewire-purge/internal/purge"
 	"limewire-purge/internal/s3store"
 	"limewire-purge/internal/spconfig"
-	"limewire-purge/internal/spdb"
 )
 
 func main() {
@@ -378,12 +377,6 @@ func runPurge(ctx context.Context, args []string) (retErr error) {
 	}
 	log.Printf("size check: data-chunks=%d segment-size=%d (primary expects payload_size, secondary expects sum of ceil(segment/data-chunks))", dc, seg)
 
-	meta, err := spdb.Open(cfg.SpDB.DSN())
-	if err != nil {
-		return err
-	}
-	defer meta.Close()
-
 	cnt, err := pg.SubCounts(ctx, task.ID)
 	if err != nil {
 		return err
@@ -403,7 +396,7 @@ func runPurge(ctx context.Context, args []string) (retErr error) {
 	}
 
 	r := &purge.Runner{
-		Store: store, Chain: chainAdapter{ch}, Meta: meta, Progress: progressAdapter{pg, task.ID},
+		Store: store, Chain: chainAdapter{ch}, Progress: progressAdapter{pg, task.ID},
 		Check:    pg.CheckLock,
 		OnSafety: func(cctx context.Context, oid uint64, e error) error { return pg.Hold(cctx, task.ID, &oid, e.Error()) },
 		Opt: purge.Options{Bucket: c.bucket, Concurrency: *conc, QPS: *qps, MaxRetry: *maxRetry, DryRun: *dryRun,

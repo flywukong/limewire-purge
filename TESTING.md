@@ -8,7 +8,7 @@
 
 - 在现有代码目录检查 `git status --short`、`git remote -v` 和 `git branch -vv`，确认仓库/分支无误且没有未保存修改后，再 `git pull --ff-only`。
 - 在测试环境对应的 Linux 构建机执行 `make build`、`make test`，记录 `git rev-parse HEAD`；替换二进制前停止旧的清理工具进程，避免测试时混用版本。编译要求见后面的本地环境章节。
-- 确认本 SP 的 config、BSDB/SpDB、物理桶、链 RPC/chain ID、目标 bucket 名称/ID。先处置测试范围的 challenge/attestation 风险，停止目标对象的回写，核对 BSDB 已同步。
+- 确认本 SP 的 config、BSDB、物理桶、链 RPC/chain ID、目标 bucket 名称/ID。先处置测试范围的 challenge/attestation 风险，停止目标对象的回写，核对 BSDB 已同步。
 - 使用本轮新建的空 MySQL 进度库，**每个 SP 一个库**。旧库保留；不要删除旧记录、复制其他 SP 的库或手改 COMPLETE/DONE 状态。若只是本轮中断续跑，则继续用本轮同一个库，不再创建新库。
 - 准备新测试对象：小对象、多段对象，以及另一个逻辑 bucket 的对照对象。记录对照对象的内容摘要，清理前后都验证可读且摘要一致。只有要覆盖超过 1000 key 的分批路径时，才需要按实际 segment 参数准备足够大的对象。
 
@@ -66,12 +66,12 @@ mkdir -p ./test-logs
 | 场景 | 预期结果 |
 |---|---|
 | 空扫描/错误 bucket ID | count-only 可显示 0；正式 scan 报错、不封存；历史空库不显示 ALL_DONE |
-| 正常小任务 | 链上身份检查 → 按前缀批删 → 清本地元数据 → 独立 verify → DONE；其他 bucket 对照数据不变 |
+| 正常小任务 | 链上身份检查 → 按前缀批删 → 复查为空 → 独立 verify → DONE；其他 bucket 对照数据不变；SpDB 中该批 oid 的行数删除前后不变 |
 | 无任务/显式 task ID | purge 不自动创建；默认只选当前待删任务；显式 ID 可补删旧未验收批次，不能直接删已 DONE 批次 |
 | 删除与验收解耦 | 第一批 purge 后不 verify，直接创建并删除第二批；默认 verify 仍选第一批，每次仅验一批；全部删除但未验收时不得 ALL_DONE |
 | 旧批次验收失败 | 第一批 RESIDUE / ERROR 不阻塞第二批；按 ID 补删第一批后整批重新验收；任一批 SAFETY_HOLD 仍禁止继续创建/删除 |
 | 多任务运行显示 | status 只把当前持锁连接匹配的批次显示为 RUNNING / VERIFYING，其余待验收批次不误标运行 |
-| 短暂 RPC/SpDB 故障 | 临时错误最多 3 次应用层尝试，间隔 1 秒/2 秒；恢复后继续，永久错误不盲目重试 |
+| 短暂 RPC 故障 | 临时错误最多 3 次应用层尝试，间隔 1 秒/2 秒；恢复后继续，永久错误不盲目重试 |
 | piece 重试耗尽，并发设为 2 | 打印 !!! STOP 和 task/OID/原因；不开始新对象，在途对象完成或自身失败并尽量落库后退出；不自动补跑、不产生普通失败的 SAFETY_HOLD |
 | 普通失败排障后重跑 | 原 purge 命令继续失败和未完成对象，保留已完成进度，不需 task resume；部分残留重新列举 |
 | Ctrl+C/失锁/安全异常 | 立即取消，不等待普通失败收尾；安全异常持久化 SAFETY_HOLD |
@@ -197,7 +197,7 @@ CONF=~/.local/sp0/config.toml
 - 删完后 `mc ls local/sp0 | grep s<oid>_` 为空；对照对象所在桶不受影响。
 - `status` 的子任务成员、处理状态和验收状态对得上；deleted_bytes 与对象大小成比例
   （primary ≈ payload，secondary ≈ payload/data_chunks）。
-- SpDB 里 `integrity_meta_NN` / `piece_hash` 中该 oid 的行已清。
+- SpDB 里 `integrity_meta_NN` / `piece_hash` 中该 oid 的行保留不变（工具不连接 SpDB）；删除后从 SP 下载该对象应失败且 SP 不崩溃。
 - 验证默认 500GiB、超大对象独立成批、--max-objects 截断；重复 create 返回原任务。
 - 删除中途结束进程后重跑，只清实际残留；verify 中断后续验，--restart 重新检查全批。
 - 在测试桶对一个 key 制造拒删：失败保留当前任务；task defer --oid ... --reason ... 后，不计 PASS，验收其余项得到 DONE_WITH_EXCEPTIONS；再 task create --retry-deferred 显式回收该项。

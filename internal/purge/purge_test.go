@@ -12,36 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-sql-driver/mysql"
-
 	"limewire-purge/internal/s3store"
 )
-
-type transientMeta struct{ deletes, reads int }
-
-func (m *transientMeta) Delete(context.Context, uint64) error {
-	m.deletes++
-	if m.deletes == 1 {
-		return &mysql.MySQLError{Number: 1213}
-	}
-	return nil
-}
-func (m *transientMeta) Exists(context.Context, uint64) (bool, error) {
-	m.reads++
-	if m.reads == 1 {
-		return false, &mysql.MySQLError{Number: 2013}
-	}
-	return false, nil
-}
-
-func TestPurgeRetriesMetadataDeleteAndRecheck(t *testing.T) {
-	meta := &transientMeta{}
-	r := &Runner{Store: newFakeStore("s1_s0"), Chain: fakeChain{bucketOf: map[uint64]string{1: "limewire"}}, Meta: meta, Opt: Options{Bucket: "limewire"}}
-	result := r.ProcessOne(context.Background(), sealed(1))
-	if result.Err != nil || meta.deletes != 2 || meta.reads != 2 {
-		t.Fatalf("result=%+v delete=%d reads=%d", result, meta.deletes, meta.reads)
-	}
-}
 
 type ordinaryStopChain struct{ started, release chan struct{} }
 
@@ -74,7 +46,7 @@ func TestOrdinaryFailureDrainsInFlightAndLogsCause(t *testing.T) {
 	ch := ordinaryStopChain{started: make(chan struct{}), release: make(chan struct{})}
 	st := newFakeStore("s1_s0", "s2_s0", "s3_s0")
 	pg := &fakeProgress{pending: []uint64{1, 2, 3}, done: map[uint64][2]uint64{}, failed: map[uint64]string{}}
-	r := &Runner{Store: st, Chain: ch, Meta: &fakeMeta{rows: map[uint64]bool{}}, Progress: pg,
+	r := &Runner{Store: st, Chain: ch, Progress: pg,
 		Opt: Options{Bucket: "limewire", Concurrency: 2, QPS: 1e6},
 		OnSafety: func(context.Context, uint64, error) error {
 			t.Error("ordinary failure triggered safety hold")
@@ -115,7 +87,7 @@ func TestOrdinaryFailureDrainsInFlightAndLogsCause(t *testing.T) {
 func TestOperatorCancellationInterruptsOrdinaryDrain(t *testing.T) {
 	ch := ordinaryStopChain{started: make(chan struct{}), release: make(chan struct{})}
 	pg := &fakeProgress{pending: []uint64{1, 2, 3}, done: map[uint64][2]uint64{}, failed: map[uint64]string{}}
-	r := &Runner{Store: newFakeStore("s1_s0"), Chain: ch, Meta: &fakeMeta{rows: map[uint64]bool{}}, Progress: pg,
+	r := &Runner{Store: newFakeStore("s1_s0"), Chain: ch, Progress: pg,
 		Opt: Options{Bucket: "limewire", Concurrency: 2, QPS: 1e6}}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -258,23 +230,6 @@ func (c fakeChain) HeadObject(_ context.Context, oid uint64) (ObjectHead, error)
 // sealed is the scan snapshot of an object fakeChain knows, payload 0.
 func sealed(oid uint64) Claimed { return Claimed{OID: oid, Status: "SEALED"} }
 
-type fakeMeta struct {
-	mu   sync.Mutex
-	rows map[uint64]bool
-}
-
-func (m *fakeMeta) Delete(_ context.Context, oid uint64) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.rows, oid)
-	return nil
-}
-func (m *fakeMeta) Exists(_ context.Context, oid uint64) (bool, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.rows[oid], nil
-}
-
 type fakeProgress struct {
 	mu       sync.Mutex
 	pending  []uint64
@@ -324,8 +279,8 @@ func (p *fakeProgress) Fail(_ context.Context, oid, k, b uint64, reason string) 
 	return nil
 }
 
-func newRunner(st *fakeStore, ch fakeChain, meta *fakeMeta) *Runner {
-	return &Runner{Store: st, Chain: ch, Meta: meta, Opt: Options{Bucket: "limewire", MaxRetry: 3, QPS: 1e6}}
+func newRunner(st *fakeStore, ch fakeChain) *Runner {
+	return &Runner{Store: st, Chain: ch, Opt: Options{Bucket: "limewire", MaxRetry: 3, QPS: 1e6}}
 }
 
 // ---- the L0 cases ------------------------------------------------------
@@ -337,8 +292,7 @@ func TestPrefixBoundary(t *testing.T) {
 		"s42268_s0", "s42268_s1", "s42268_s0_v2", "e42268_s0_p3",
 		"s422680_s0", "e422680_s0_p3", "s4226_s0", "s99999_s0", "e99999_s0_p1",
 	)
-	meta := &fakeMeta{rows: map[uint64]bool{42268: true, 99999: true}}
-	r := newRunner(st, fakeChain{bucketOf: map[uint64]string{42268: "limewire", 99999: "other-bucket"}}, meta)
+	r := newRunner(st, fakeChain{bucketOf: map[uint64]string{42268: "limewire", 99999: "other-bucket"}})
 	r.lim = nil
 
 	res := r.ProcessOne(context.Background(), sealed(42268))
@@ -353,9 +307,6 @@ func TestPrefixBoundary(t *testing.T) {
 	sort.Strings(want)
 	if fmt.Sprint(left) != fmt.Sprint(want) {
 		t.Fatalf("survivors %v, want %v", left, want)
-	}
-	if meta.rows[42268] || !meta.rows[99999] {
-		t.Fatalf("metadata rows: %v", meta.rows)
 	}
 
 	// 99999 is in the list but the chain says another bucket → nothing deleted, failed
@@ -375,7 +326,7 @@ func Test2500KeysBatched(t *testing.T) {
 		keys = append(keys, fmt.Sprintf("s7_s%d", i))
 	}
 	st := newFakeStore(keys...)
-	r := newRunner(st, fakeChain{bucketOf: map[uint64]string{7: "limewire"}}, &fakeMeta{rows: map[uint64]bool{}})
+	r := newRunner(st, fakeChain{bucketOf: map[uint64]string{7: "limewire"}})
 	r.lim = nil
 	res := r.ProcessOne(context.Background(), sealed(7))
 	if res.Err != nil || res.Keys != 2500 {
@@ -399,7 +350,7 @@ func TestPartialFailureRetried(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		st.failKeys[fmt.Sprintf("s8_s%d", i)] = 1
 	}
-	r := newRunner(st, fakeChain{bucketOf: map[uint64]string{8: "limewire"}}, &fakeMeta{rows: map[uint64]bool{}})
+	r := newRunner(st, fakeChain{bucketOf: map[uint64]string{8: "limewire"}})
 	r.lim = nil
 	res := r.ProcessOne(context.Background(), sealed(8))
 	if res.Err != nil || res.Keys != 1000 || len(st.objs) != 0 {
@@ -412,7 +363,7 @@ func TestPartialFailureRetried(t *testing.T) {
 func TestPersistentFailureGivesUp(t *testing.T) {
 	st := newFakeStore("s9_s0", "s9_s1", "s9_s2")
 	st.failKeys["s9_s2"] = 1000
-	r := newRunner(st, fakeChain{bucketOf: map[uint64]string{9: "limewire"}}, &fakeMeta{rows: map[uint64]bool{}})
+	r := newRunner(st, fakeChain{bucketOf: map[uint64]string{9: "limewire"}})
 	r.lim = nil
 	res := r.ProcessOne(context.Background(), sealed(9))
 	if res.Err == nil || !strings.Contains(res.Err.Error(), "still failing after 3 retries") {
@@ -439,7 +390,7 @@ func TestPerPieceRetryCount(t *testing.T) {
 	}
 	st := newFakeStore(keys...)
 	st.failKeys["s13_s0"] = 1000 // sorts first, so it is in every listing window
-	r := newRunner(st, fakeChain{bucketOf: map[uint64]string{13: "limewire"}}, &fakeMeta{rows: map[uint64]bool{}})
+	r := newRunner(st, fakeChain{bucketOf: map[uint64]string{13: "limewire"}})
 	r.lim = nil
 	res := r.ProcessOne(context.Background(), sealed(13))
 	if res.Err == nil || res.Keys != 2499 {
@@ -457,7 +408,7 @@ func TestPerPieceRetryCount(t *testing.T) {
 func TestListErrorRetried(t *testing.T) {
 	st := newFakeStore("s14_s0")
 	st.listErrN = 3 // MaxRetry is 3, so exactly at the limit still recovers
-	r := newRunner(st, fakeChain{bucketOf: map[uint64]string{14: "limewire"}}, &fakeMeta{rows: map[uint64]bool{}})
+	r := newRunner(st, fakeChain{bucketOf: map[uint64]string{14: "limewire"}})
 	r.lim = nil
 	res := r.ProcessOne(context.Background(), sealed(14))
 	if res.Err != nil || res.Keys != 1 {
@@ -476,7 +427,7 @@ func TestListErrorRetried(t *testing.T) {
 func TestRequestErrorRetriedThenSucceeds(t *testing.T) {
 	st := newFakeStore("s11_s0", "s11_s1")
 	st.deleteErrN = 3 // first 3 delete requests error out, then succeed
-	r := newRunner(st, fakeChain{bucketOf: map[uint64]string{11: "limewire"}}, &fakeMeta{rows: map[uint64]bool{}})
+	r := newRunner(st, fakeChain{bucketOf: map[uint64]string{11: "limewire"}})
 	r.lim = nil
 	res := r.ProcessOne(context.Background(), sealed(11))
 	if res.Err != nil || res.Keys != 2 || len(st.objs) != 0 {
@@ -488,7 +439,7 @@ func TestRequestErrorRetriedThenSucceeds(t *testing.T) {
 func TestRequestErrorGivesUp(t *testing.T) {
 	st := newFakeStore("s12_s0")
 	st.deleteErrN = -1 // always error
-	r := newRunner(st, fakeChain{bucketOf: map[uint64]string{12: "limewire"}}, &fakeMeta{rows: map[uint64]bool{}})
+	r := newRunner(st, fakeChain{bucketOf: map[uint64]string{12: "limewire"}})
 	r.lim = nil
 	res := r.ProcessOne(context.Background(), sealed(12))
 	if res.Err == nil || !strings.Contains(res.Err.Error(), "after") {
@@ -503,30 +454,23 @@ func TestRequestErrorGivesUp(t *testing.T) {
 func TestResumeAfterInterruption(t *testing.T) {
 	st := newFakeStore("s5_s0", "s5_s1", "s5_s2", "s5_s3")
 	st.failKeys["s5_s3"] = 1000
-	meta := &fakeMeta{rows: map[uint64]bool{5: true}}
-	r := newRunner(st, fakeChain{bucketOf: map[uint64]string{5: "limewire"}}, meta)
+	r := newRunner(st, fakeChain{bucketOf: map[uint64]string{5: "limewire"}})
 	r.lim = nil
 	first := r.ProcessOne(context.Background(), sealed(5))
 	if first.Err == nil || first.Keys != 3 {
 		t.Fatalf("first attempt: %+v", first)
 	}
-	if !meta.rows[5] {
-		t.Fatal("metadata must not be cleared while pieces remain")
-	}
 	st.failKeys["s5_s3"] = 0 // the cause is fixed
 	second := r.ProcessOne(context.Background(), sealed(5))
-	if second.Err != nil || second.Keys != 1 {
-		t.Fatalf("second attempt: %+v", second)
-	}
-	if meta.rows[5] {
-		t.Fatal("metadata should now be gone")
+	if second.Err != nil || second.Keys != 1 || len(st.objs) != 0 {
+		t.Fatalf("second attempt: %+v left=%v", second, st.objs)
 	}
 }
 
 // Dry-run counts everything and deletes nothing.
 func TestDryRun(t *testing.T) {
 	st := newFakeStore("s6_s0", "e6_s0_p1", "s60_s0")
-	r := newRunner(st, fakeChain{bucketOf: map[uint64]string{6: "limewire"}}, &fakeMeta{rows: map[uint64]bool{6: true}})
+	r := newRunner(st, fakeChain{bucketOf: map[uint64]string{6: "limewire"}})
 	r.Opt.DryRun = true
 	r.lim = nil
 	res := r.ProcessOne(context.Background(), sealed(6))
@@ -540,7 +484,7 @@ func TestRunEndToEnd(t *testing.T) {
 	st := newFakeStore("s1_s0", "s2_s0", "e2_s0_p0", "s3_s0")
 	pg := &fakeProgress{pending: []uint64{1, 2, 3}, done: map[uint64][2]uint64{}, failed: map[uint64]string{}}
 	// The chain does not know oid 3: an ordinary failure stops the run.
-	r := newRunner(st, fakeChain{bucketOf: map[uint64]string{1: "limewire", 2: "limewire"}}, &fakeMeta{rows: map[uint64]bool{}})
+	r := newRunner(st, fakeChain{bucketOf: map[uint64]string{1: "limewire", 2: "limewire"}})
 	r.Progress = pg
 	r.Opt.Concurrency = 1
 	err := r.Run(context.Background(), 3)
@@ -575,7 +519,7 @@ func TestRunHaltsOnIdentityMismatch(t *testing.T) {
 	st := newFakeStore("s1_s0", "s2_s0", "s3_s0")
 	pg := &fakeProgress{pending: []uint64{1, 2, 3}, done: map[uint64][2]uint64{}, failed: map[uint64]string{}}
 	ch := &countingChain{fakeChain: fakeChain{bucketOf: map[uint64]string{1: "limewire-bak", 2: "limewire", 3: "limewire"}}, calls: map[uint64]int{}}
-	r := &Runner{Store: st, Chain: ch, Meta: &fakeMeta{rows: map[uint64]bool{}}, Progress: pg,
+	r := &Runner{Store: st, Chain: ch, Progress: pg,
 		Opt: Options{Bucket: "limewire", MaxRetry: 3, QPS: 1e6, Concurrency: 1}}
 	err := r.Run(context.Background(), 3)
 	if err == nil || !strings.Contains(err.Error(), "HALTED") || !strings.Contains(err.Error(), "oid 1") {
@@ -596,7 +540,7 @@ func TestRunHaltsOnIdentityMismatch(t *testing.T) {
 func TestRunHaltsOnUnknownKey(t *testing.T) {
 	st := newFakeStore("s1_backup", "s1_s0", "s2_s0")
 	pg := &fakeProgress{pending: []uint64{1, 2}, done: map[uint64][2]uint64{}, failed: map[uint64]string{}}
-	r := &Runner{Store: st, Chain: fakeChain{bucketOf: map[uint64]string{1: "limewire", 2: "limewire"}}, Meta: &fakeMeta{rows: map[uint64]bool{}},
+	r := &Runner{Store: st, Chain: fakeChain{bucketOf: map[uint64]string{1: "limewire", 2: "limewire"}},
 		Progress: pg, Opt: Options{Bucket: "limewire", MaxRetry: 3, QPS: 1e6, Concurrency: 1}}
 	err := r.Run(context.Background(), 2)
 	if err == nil || !strings.Contains(err.Error(), "HALTED") {
@@ -611,7 +555,7 @@ func TestRunHaltsOnUnknownKey(t *testing.T) {
 func TestDryRunDoesNotHalt(t *testing.T) {
 	st := newFakeStore("s1_s0", "s2_s0")
 	ch := &countingChain{fakeChain: fakeChain{bucketOf: map[uint64]string{1: "limewire-bak", 2: "limewire-bak"}}, calls: map[uint64]int{}}
-	r := &Runner{Store: st, Chain: ch, Meta: &fakeMeta{rows: map[uint64]bool{}},
+	r := &Runner{Store: st, Chain: ch,
 		Progress: &fakeProgress{pending: []uint64{1, 2}, done: map[uint64][2]uint64{}, failed: map[uint64]string{}},
 		Opt:      Options{Bucket: "limewire", MaxRetry: 3, QPS: 1e6, Concurrency: 1, DryRun: true}}
 	if err := r.Run(context.Background(), 2); err == nil {
@@ -628,7 +572,7 @@ func TestRunStopsAfterPieceRetriesAndResumesOnRerun(t *testing.T) {
 	st := newFakeStore("s1_s0", "s2_s0", "s3_s0")
 	st.failKeys["s2_s0"] = 2 // MaxRetry=1: fails both attempts
 	pg := &fakeProgress{pending: []uint64{1, 2, 3}, done: map[uint64][2]uint64{}, failed: map[uint64]string{}}
-	r := newRunner(st, fakeChain{bucketOf: map[uint64]string{1: "limewire", 2: "limewire", 3: "limewire"}}, &fakeMeta{rows: map[uint64]bool{}})
+	r := newRunner(st, fakeChain{bucketOf: map[uint64]string{1: "limewire", 2: "limewire", 3: "limewire"}})
 	r.Progress = pg
 	r.Opt.MaxRetry = 1
 	r.Opt.Concurrency = 1
@@ -647,7 +591,7 @@ func TestRunStopsAfterPieceRetriesAndResumesOnRerun(t *testing.T) {
 	}
 	// Simulate the real progress adapter selecting failed and pending only.
 	pg.pending = []uint64{2, 3}
-	next := newRunner(st, fakeChain{bucketOf: map[uint64]string{2: "limewire", 3: "limewire"}}, &fakeMeta{rows: map[uint64]bool{}})
+	next := newRunner(st, fakeChain{bucketOf: map[uint64]string{2: "limewire", 3: "limewire"}})
 	next.Progress = pg
 	if err := next.Run(context.Background(), 2); err != nil {
 		t.Fatalf("rerun should resume after the cause is fixed: %v", err)
@@ -662,7 +606,7 @@ func TestRunDoneWriteFailureRecoveredOnManualRerun(t *testing.T) {
 	st := newFakeStore("s1_s0", "s2_s0")
 	pg := &fakeProgress{pending: []uint64{1, 2}, done: map[uint64][2]uint64{}, failed: map[uint64]string{},
 		doneErrN: map[uint64]int{2: 1}}
-	r := newRunner(st, fakeChain{bucketOf: map[uint64]string{1: "limewire", 2: "limewire"}}, &fakeMeta{rows: map[uint64]bool{}})
+	r := newRunner(st, fakeChain{bucketOf: map[uint64]string{1: "limewire", 2: "limewire"}})
 	r.Progress = pg
 	r.Opt.Concurrency = 1
 	if err := r.Run(context.Background(), 2); err == nil || !strings.Contains(err.Error(), "completion NOT recorded") {
@@ -672,7 +616,7 @@ func TestRunDoneWriteFailureRecoveredOnManualRerun(t *testing.T) {
 		t.Fatal("must not automatically retry the failed write")
 	}
 	pg.pending = []uint64{2}
-	next := newRunner(st, fakeChain{bucketOf: map[uint64]string{2: "limewire"}}, &fakeMeta{rows: map[uint64]bool{}})
+	next := newRunner(st, fakeChain{bucketOf: map[uint64]string{2: "limewire"}})
 	next.Progress = pg
 	if err := next.Run(context.Background(), 1); err != nil {
 		t.Fatalf("manual rerun should reconcile progress: %v", err)
@@ -688,7 +632,7 @@ func TestRunDoneWriteFailureFailsRun(t *testing.T) {
 	st := newFakeStore("s1_s0", "s2_s0")
 	pg := &fakeProgress{pending: []uint64{1, 2}, done: map[uint64][2]uint64{}, failed: map[uint64]string{},
 		doneErrN: map[uint64]int{2: -1}}
-	r := newRunner(st, fakeChain{bucketOf: map[uint64]string{1: "limewire", 2: "limewire"}}, &fakeMeta{rows: map[uint64]bool{}})
+	r := newRunner(st, fakeChain{bucketOf: map[uint64]string{1: "limewire", 2: "limewire"}})
 	r.Progress = pg
 	err := r.Run(context.Background(), 2)
 	if err == nil || !strings.Contains(err.Error(), "1 results not recorded") {
@@ -703,18 +647,17 @@ func TestRunDoneWriteFailureFailsRun(t *testing.T) {
 }
 
 // A key under the object's prefix in a layout the SP never writes is not guessed
-// at: nothing from that listing is deleted, the object fails, metadata stays.
+// at: nothing from that listing is deleted and the object fails.
 func TestUnknownKeyLayoutLeftForInspection(t *testing.T) {
 	st := newFakeStore("s5_backup", "s5_s0", "s5_s1")
-	meta := &fakeMeta{rows: map[uint64]bool{5: true}}
-	r := newRunner(st, fakeChain{bucketOf: map[uint64]string{5: "limewire"}}, meta)
+	r := newRunner(st, fakeChain{bucketOf: map[uint64]string{5: "limewire"}})
 	r.lim = nil
 	res := r.ProcessOne(context.Background(), sealed(5))
 	if !errors.Is(res.Err, ErrSafety) || !strings.Contains(res.Err.Error(), "not well-formed pieces") || res.Keys != 0 {
 		t.Fatalf("want unknown-layout safety failure with nothing deleted, got %+v", res)
 	}
-	if len(st.sorted("s5_")) != 3 || !meta.rows[5] {
-		t.Fatalf("prefix and metadata must be left as found: keys=%v meta=%v", st.sorted("s5_"), meta.rows)
+	if len(st.sorted("s5_")) != 3 {
+		t.Fatalf("prefix must be left as found: keys=%v", st.sorted("s5_"))
 	}
 
 	// dry-run reports it the same way
@@ -739,20 +682,19 @@ func TestChainIdentityMismatchDeletesNothing(t *testing.T) {
 	}
 	for name, c := range cases {
 		st := newFakeStore("s7_s0")
-		meta := &fakeMeta{rows: map[uint64]bool{7: true}}
-		r := &Runner{Store: st, Chain: fixedChain{c.head}, Meta: meta, Opt: Options{Bucket: "limewire", MaxRetry: 3}}
+		r := &Runner{Store: st, Chain: fixedChain{c.head}, Opt: Options{Bucket: "limewire", MaxRetry: 3}}
 		res := r.ProcessOne(context.Background(), Claimed{OID: 7, Status: "SEALED", PayloadSize: 10})
 		if !errors.Is(res.Err, ErrSafety) || !strings.Contains(res.Err.Error(), c.want) || !strings.Contains(res.Err.Error(), "nothing deleted") {
 			t.Errorf("%s: got %v", name, res.Err)
 		}
-		if len(st.objs) != 1 || !meta.rows[7] || st.lists != 0 {
-			t.Errorf("%s: storage or metadata touched (keys=%v meta=%v lists=%d)", name, st.objs, meta.rows, st.lists)
+		if len(st.objs) != 1 || st.lists != 0 {
+			t.Errorf("%s: storage touched (keys=%v lists=%d)", name, st.objs, st.lists)
 		}
 	}
 
 	// a failed lookup is a failure too, never "trust the snapshot and delete"
 	st := newFakeStore("s7_s0")
-	r := &Runner{Store: st, Chain: fakeChain{}, Meta: &fakeMeta{rows: map[uint64]bool{}}, Opt: Options{Bucket: "limewire", MaxRetry: 3}}
+	r := &Runner{Store: st, Chain: fakeChain{}, Opt: Options{Bucket: "limewire", MaxRetry: 3}}
 	res := r.ProcessOne(context.Background(), sealed(7))
 	if res.Err == nil || len(st.objs) != 1 {
 		t.Fatalf("lookup failure must delete nothing: %+v keys=%v", res, st.objs)
@@ -787,7 +729,7 @@ func TestRunInterrupted(t *testing.T) {
 	pg := &fakeProgress{pending: []uint64{1, 2, 3}, done: map[uint64][2]uint64{}, failed: map[uint64]string{}}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	r := &Runner{Store: st, Chain: cancelChain{cancel: cancel, at: 2}, Meta: &fakeMeta{rows: map[uint64]bool{}},
+	r := &Runner{Store: st, Chain: cancelChain{cancel: cancel, at: 2},
 		Progress: pg, Opt: Options{Bucket: "limewire", MaxRetry: 3, QPS: 1e6, Concurrency: 1}}
 	err := r.Run(ctx, 3)
 	if err == nil || !strings.Contains(err.Error(), "interrupted") {

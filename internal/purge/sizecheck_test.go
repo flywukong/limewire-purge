@@ -41,7 +41,7 @@ func TestExpectedSecondaryBytesMatchesSP(t *testing.T) {
 func newCheckRunner(st *fakeStore, oid uint64) (*Runner, *fakeProgress) {
 	payload := map[uint64]uint64{}
 	pg := &fakeProgress{pending: []uint64{oid}, payload: payload, done: map[uint64][2]uint64{}, checks: map[uint64]SizeCheck{}, failed: map[uint64]string{}}
-	r := newRunner(st, fakeChain{bucketOf: map[uint64]string{oid: "limewire"}, payload: payload}, &fakeMeta{rows: map[uint64]bool{}})
+	r := newRunner(st, fakeChain{bucketOf: map[uint64]string{oid: "limewire"}, payload: payload})
 	r.Progress = pg
 	r.Opt.Concurrency = 1
 	r.Opt.DataChunks = 3

@@ -1,5 +1,6 @@
-// Package verify independently checks physical residue and local metadata.
-// It never deletes and never assumes purge's DONE means verification PASS.
+// Package verify independently checks physical residue under both piece prefixes.
+// It never deletes and never assumes purge's DONE means verification PASS. The
+// SP's own metadata (SpDB) is out of scope: purge keeps it.
 package verify
 
 import (
@@ -18,16 +19,12 @@ import (
 type Store interface {
 	Empty(context.Context, string) (bool, error)
 }
-type Meta interface {
-	Exists(context.Context, uint64) (bool, error)
-}
 type Progress interface {
 	VerifyPending(context.Context, progress.Subtask, uint64, int) ([]progress.VerifyRow, error)
 	RecordVerify(context.Context, progress.Subtask, uint64, string, string) error
 }
 type Runner struct {
 	Store    Store
-	Meta     Meta
 	Progress Progress
 	Task     progress.Subtask
 	Check    func(context.Context) error
@@ -87,13 +84,6 @@ func (r *Runner) checkObject(ctx context.Context, lim *rate.Limiter, oid uint64)
 		} else if !empty {
 			residue = append(residue, prefix)
 		}
-	}
-	var exists bool
-	err := r.retry(ctx, lim, func(ctx context.Context) error { var e error; exists, e = r.Meta.Exists(ctx, oid); return e })
-	if err != nil {
-		problems = append(problems, "metadata: "+err.Error())
-	} else if exists {
-		residue = append(residue, "metadata")
 	}
 	// Prefer RESIDUE if any check proved residue; detail retains failed queries.
 	// This enables purge to requeue the object. The next verify still checks all.

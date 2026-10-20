@@ -3,6 +3,7 @@ package verify
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -10,10 +11,9 @@ import (
 )
 
 type fakeChecks struct {
-	calls    map[string]int
-	fail     map[string]int
-	residue  map[string]bool
-	metadata bool
+	calls   map[string]int
+	fail    map[string]int
+	residue map[string]bool
 }
 
 func (f *fakeChecks) Empty(ctx context.Context, prefix string) (bool, error) {
@@ -24,7 +24,6 @@ func (f *fakeChecks) Empty(ctx context.Context, prefix string) (bool, error) {
 	}
 	return !f.residue[prefix], nil
 }
-func (f *fakeChecks) Exists(context.Context, uint64) (bool, error) { return f.metadata, nil }
 
 type result struct {
 	gen            uint64
@@ -53,7 +52,7 @@ func (f *fakeProgress) RecordVerify(ctx context.Context, s progress.Subtask, id 
 	return nil
 }
 func runner(f *fakeChecks, p *fakeProgress) *Runner {
-	return &Runner{Store: f, Meta: f, Progress: p, Task: progress.Subtask{ID: 1, Generation: 1}, QPS: 1e9, MaxRetry: 2, Timeout: time.Second, Backoff: func(context.Context, int) error { return nil }}
+	return &Runner{Store: f, Progress: p, Task: progress.Subtask{ID: 1, Generation: 1}, QPS: 1e9, MaxRetry: 2, Timeout: time.Second, Backoff: func(context.Context, int) error { return nil }}
 }
 func checks() *fakeChecks {
 	return &fakeChecks{calls: map[string]int{}, fail: map[string]int{}, residue: map[string]bool{}}
@@ -117,15 +116,29 @@ func TestVerifyLockLossStops(t *testing.T) {
 	}
 }
 
-func TestVerifyMetadataAndPartialErrorNotPass(t *testing.T) {
+// Residue under one prefix wins over a failed check of the other, so purge
+// can requeue the object; the failed query stays in the detail.
+func TestVerifyResidueAndPartialErrorNotPass(t *testing.T) {
 	f := checks()
-	f.metadata = true
+	f.residue["e1_"] = true
 	f.fail["s1_"] = 10
 	p := &fakeProgress{ids: []uint64{1}, results: map[uint64]result{}}
 	if err := runner(f, p).Run(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if p.results[1].status != "RESIDUE" {
+	if r := p.results[1]; r.status != "RESIDUE" || !strings.Contains(r.detail, "e1_") || !strings.Contains(r.detail, "s1_") {
 		t.Fatal(p.results)
+	}
+}
+
+// Only the two piece prefixes are checked: two requests per object.
+func TestVerifyChecksOnlyPiecePrefixes(t *testing.T) {
+	f := checks()
+	p := &fakeProgress{ids: []uint64{7}, results: map[uint64]result{}}
+	if err := runner(f, p).Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if p.results[7].status != "PASS" || len(f.calls) != 2 || f.calls["s7_"] != 1 || f.calls["e7_"] != 1 {
+		t.Fatalf("results=%v calls=%v", p.results, f.calls)
 	}
 }

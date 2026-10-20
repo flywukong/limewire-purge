@@ -119,7 +119,7 @@ func (s *Store) Empty(ctx context.Context, prefix string) (bool, error) {
 // only ever deletes by key, which on a versioned bucket does not do what we need:
 // with versioning Enabled a plain delete just writes a delete marker and the data
 // survives as a noncurrent version, still billed, while every listing here reports
-// the prefix as empty — the tool would clear metadata and call the object done.
+// the prefix as empty — the tool would call the object done.
 // With versioning Suspended the current ("null") version IS removed, so space is
 // freed, but any version created while it was Enabled is left behind, and each
 // delete leaves a zero-byte marker this tool cannot see.

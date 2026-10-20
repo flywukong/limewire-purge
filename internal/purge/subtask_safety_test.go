@@ -11,7 +11,7 @@ func TestSafetyLatchPersistedOnce(t *testing.T) {
 	st := newFakeStore("s1_s0", "s2_s0")
 	pg := &fakeProgress{pending: []uint64{1, 2}, done: map[uint64][2]uint64{}, failed: map[uint64]string{}}
 	calls := 0
-	r := &Runner{Store: st, Chain: fakeChain{bucketOf: map[uint64]string{1: "other", 2: "limewire"}}, Meta: &fakeMeta{rows: map[uint64]bool{}}, Progress: pg, Opt: Options{Bucket: "limewire", Concurrency: 1, QPS: 1e6},
+	r := &Runner{Store: st, Chain: fakeChain{bucketOf: map[uint64]string{1: "other", 2: "limewire"}}, Progress: pg, Opt: Options{Bucket: "limewire", Concurrency: 1, QPS: 1e6},
 		OnSafety: func(ctx context.Context, oid uint64, err error) error {
 			calls++
 			if ctx.Err() != nil || oid != 1 || !errors.Is(err, ErrSafety) {
@@ -31,7 +31,7 @@ func TestSafetyLatchPersistedOnce(t *testing.T) {
 func TestRequestGuardStopsBeforeDelete(t *testing.T) {
 	st := newFakeStore("s1_s0")
 	calls := 0
-	r := &Runner{Store: st, Chain: fakeChain{bucketOf: map[uint64]string{1: "limewire"}}, Meta: &fakeMeta{rows: map[uint64]bool{1: true}}, Opt: Options{Bucket: "limewire"}, Check: func(context.Context) error {
+	r := &Runner{Store: st, Chain: fakeChain{bucketOf: map[uint64]string{1: "limewire"}}, Opt: Options{Bucket: "limewire"}, Check: func(context.Context) error {
 		calls++
 		if calls >= 3 {
 			return errors.New("lock lost")

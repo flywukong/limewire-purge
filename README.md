@@ -1,6 +1,6 @@
 # limewire-purge
 
-按 SP 部署的物理清理工具：先全量扫描指定 Greenfield bucket 的 OID，封存到工具 MySQL；再按逻辑容量分配子任务，逐对象查链、批删 piece、清理本地元数据，最后独立验收该子任务。
+按 SP 部署的物理清理工具：先全量扫描指定 Greenfield bucket 的 OID，封存到工具 MySQL；再按逻辑容量分配子任务，逐对象查链、批删 piece 并复查，最后独立验收该子任务。SP 本地元数据（SpDB）保留不动。
 
 **不可逆物理删除，不是链上 DeleteObject / DiscontinueObject。** 不发送交易、不停止计费、不自动停用 challenge。仅用于已授权废弃 bucket；链上仍可能是 SEALED，但物理文件已无法读取。
 
@@ -11,7 +11,7 @@ scan 全量落库 → 数量对账 → COMPLETE 封存
     ↓
 task create：按约 500 GiB（可配置）固定本批 OID
     ↓
-purge --execute：当前待删除任务，逐 OID 查链 → 批删 → 清本地元数据 → 记进度
+purge --execute：当前待删除任务，逐 OID 查链 → 批删 → 复查为空 → 记进度
     ├─ 本批删除成功：写 purged_at → 可以 task create 下一批，不必等 verify
     ↓（可稍后单独执行，同一进度库仍禁止命令并发）
 verify：默认验收最早一批待验收任务，逐 OID 保存验收结果
@@ -96,8 +96,8 @@ purge_chain=(
 |---|---|---|---|---|---|
 | scan | 读全量存活对象 | — | — | — | 写名单、绑定、封存 |
 | task create/defer/resume | — | — | — | — | 分配任务 / 延期 / 解除暂停 |
-| purge | — | 查 bucket ID 和逐对象身份 | 列举、批删、复查 | 按 OID 删除、复查 | 读任务名单，写逐对象结果 |
-| verify | — | — | 只读检查两前缀 | 只读检查 | 保存验收代次和断点，完成任务 |
+| purge | — | 查 bucket ID 和逐对象身份 | 列举、批删、复查 | — | 读任务名单，写逐对象结果 |
+| verify | — | — | 只读检查两前缀 | — | 保存验收代次和断点，完成任务 |
 | status | — | — | — | — | 只读汇总，不建表、不拿锁 |
 
 一个 OID 对应一个 GNFD 链上 object，不是一个 S3 key。工具进度库是 `--progress-dsn` 指定的 MySQL，不是自动创建的本地 SQLite；同一个 SP 的各子任务共用该库的不同任务记录，**不需要每批一个物理子库**。
@@ -130,16 +130,16 @@ purge_chain=(
 2. 每个 OID 删前查链，核对返回 OID、bucket、状态、版本、payload 与冻结名单一致。查不到是普通失败，不退回仅信本地记录；身份不符是安全异常。
 3. 扫本 SP 配置物理桶的 `s<oid>_`、`e<oid>_`，不根据当前 primary/secondary 角色跳过。
 4. 严格校验完整 key 格式及 OID，删除入口再次校验；每轮最多 1000 个 key，用 `DeleteObjects` 批删并检查逐 key 响应。
-5. 从前缀开头重新列举剩余 key，直到两个前缀为空并复查；再按 OID 清理本地 `integrity_meta_NN`、`piece_hash` 并复查。
+5. 从前缀开头重新列举剩余 key，直到两个前缀为空并复查。SpDB 的 `integrity_meta_NN`、`piece_hash` 不删除，工具不连接 SpDB。
 6. 每个 OID 完成或失败后写进度，不是每个 piece 写一次 DB。完成写入和残留标记清除处于同一事务。
 
 2500 个 key 分为最多 1000 + 1000 + 500 三批，不是 2500 个单删请求。
 每个失败 piece 独立计数；整批请求失败则本批未成功 key 各加一次。默认 `--max-retry 10` 是首次尝试加最多 10 次重试。
-某 key 耗尽预算则停止该 OID，保留元数据；不保证该对象其他 key 全部删完。
+某 key 耗尽预算则停止该 OID；不保证该对象其他 key 全部删完。
 列举报错另计连续次数；成功列举清零。批次间按失败数退避，最多 30 秒。
 
-一个对象内部重试耗尽仍失败，就打印醒目的 `!!! STOP`（日志含 task、OID、错误原因），停止派发新对象；队列里尚未开始的对象留待下次，已开始的对象继续处理至完成或自身失败、尽量记录结果后非零退出。不再自动补跑对象、不继续遍历整批。链查询或元数据操作最终报错、进度读写失败同样停止新对象。收尾没有固定几分钟上限，大对象可能更久；自身失败仍可能留下部分残留。
-链查询的超时、连接拒绝/重置、HTTP 429/5xx 等临时错误，以及 SpDB 删除/复查的临时连接故障、死锁等，各最多 3 次应用层尝试，间隔 1 秒、2 秒。SpDB 每次尝试限时 30 秒；两张表按 OID 删除可安全重试。权限错误、对象不存在、表不存在等不盲目重试；身份/快照不符不重试。驱动内部重试不计入这 3 次。
+一个对象内部重试耗尽仍失败，就打印醒目的 `!!! STOP`（日志含 task、OID、错误原因），停止派发新对象；队列里尚未开始的对象留待下次，已开始的对象继续处理至完成或自身失败、尽量记录结果后非零退出。不再自动补跑对象、不继续遍历整批。链查询最终报错、进度读写失败同样停止新对象。收尾没有固定几分钟上限，大对象可能更久；自身失败仍可能留下部分残留。
+链查询的超时、连接拒绝/重置、HTTP 429/5xx 等临时错误最多 3 次应用层尝试，间隔 1 秒、2 秒。权限错误、对象不存在等不盲目重试；身份/快照不符不重试。
 普通失败不写 SAFETY_HOLD：根据日志排障后重跑原 purge 命令即可，默认领取失败和未完成对象，不需要 task resume。恢复重新列实际残留，不依赖 segment 游标。dry-run 仍仅预览，不因单个对象报错提前停止。
 删除已完成但结果未落库也会停止；重跑复查后补写。统计可能漏记“删完未落库”的字节，不能用于精确账单核算。此规则仅修改 purge，verify 的逐对象验收/重试行为不变。
 
@@ -163,7 +163,7 @@ secondary 公式可逐字节复现 SP 的实际存储（本地 3+3 实测：5 Mi
 ### verify 独立验收
 
 每次仅验收一批全部未延期 OID，不扫描其他任务。默认按任务 ID 升序选最早待验收批次，也可显式指定。要求该批对象已处理成功；有未处理/失败项须先按 ID purge 或人工 defer。待验收不阻塞下一批删除，ALL_DONE 仍要求所有批次验收结束且无未解决延期项。
-对每个 OID 检查两个前缀是否为空（只需至多返回一个 key），以及本地元数据是否存在；无需再次列出数千个已删 key。
+对每个 OID 检查两个前缀是否为空（只需至多返回一个 key），每个对象 2 个请求；无需再次列出数千个已删 key。SpDB 元数据不在验收范围内。
 
 逐 OID 记录 PASS / RESIDUE / ERROR 与验收代次。单个查询失败默认额外重试 3 次，仍失败记录 ERROR 并继续其他对象；不会被当成空。
 进度落库失败或锁丢失立即停止。中断重跑跳过本代次 PASS，删除再次启动则旧 PASS 整批失效。
@@ -207,7 +207,7 @@ status 默认展开当前待删除批次和所有待验收批次，另输出 sta
 | 链 ID | SP TOML `[Chain] ChainID`（为空时同 SP 一样取 `greenfield_9000-121`） |
 | SP operator 地址 | SP TOML `[SpAccount] SpOperatorAddress` |
 | 物理桶 | `BucketURL`（`BUCKET_URL` 优先）解析出的 endpoint（AWS 默认 endpoint 记为 `aws:<region>`）加桶名，path / virtual-hosted 写法视为同一个桶 |
-| SpDB | `[SpDB]` 的 `Address/Database`（环境变量优先） |
+| SpDB | `[SpDB]` 的 `Address/Database`（环境变量优先）；只用于标识是哪个 SP，工具不连接 |
 | 目标 bucket | `--bucket`、`--bucket-id` |
 
 之后 `scan`、`purge`、`verify` 每次启动都按本次的配置和参数重新计算这些字段并与库中比对，任何一项不同都拒绝运行，
@@ -238,7 +238,7 @@ status 默认展开当前待删除批次和所有待验收批次，另输出 sta
 
 ## 2. 运行前提
 
-- 每个 SP 使用自己的配置、云身份、物理桶、SpDB 和进度库。可以运行在该 SP 的 pod 内，
+- 每个 SP 使用自己的配置、云身份、物理桶和进度库。可以运行在该 SP 的 pod 内，
   或具备相同存储访问身份和网络可达性的环境中；不需要链上交易私钥。
 - 清理前由运维确认 challenge/attestation 风险已在所需范围内处置；只停本地一个进程不能视为全网已停。
   链上仍保留对象时，不能因本工具完成就恢复相关抽检。工具不会执行这些运维操作。
@@ -246,7 +246,7 @@ status 默认展开当前待删除批次和所有待验收批次，另输出 sta
   不影响其他租户的读写是执行前提，需要先在测试环境验证，再低并发、小流量试运行。
 - 当前仅支持 S3 / MinIO，`PieceStore.Shards > 1` 会直接拒绝，不会遍历多个物理分片桶。
 - `purge`（含 dry-run）和 `verify` 默认拒绝 Enabled/Suspended 桶；两条命令都可加 `--allow-versioned-bucket` 显式放行，并打印警告。版本控制查询失败仍拒绝，参数不能绕过权限或查询错误。
-  放行后仍按 key 删除，不按 `VersionId` 清理；verify/PASS/DONE 仅表示当前可见 key 和本地元数据通过检查，不代表历史版本、删除标记或计费空间已清除。
+  放行后仍按 key 删除，不按 `VersionId` 清理；verify/PASS/DONE 仅表示当前可见 key 通过检查，不代表历史版本、删除标记或计费空间已清除。
 
   已确认接受上述限制时，在原命令末尾分别添加参数：
 
@@ -256,7 +256,7 @@ status 默认展开当前待删除批次和所有待验收批次，另输出 sta
   ```
 
   示例沿用前文配置；测试环境的 purge 仍需填写对应 `--chain-id` 和 `--chain-rpc`。
-- BSDB 需 SELECT 权限；SpDB 正式清理需 SELECT、DELETE；进度库需 SELECT、INSERT、UPDATE、CREATE（旧表迁移还需 ALTER）；
+- BSDB 需 SELECT 权限；不需要 SpDB 权限；进度库需 SELECT、INSERT、UPDATE、CREATE（旧表迁移还需 ALTER）；
   S3 需列举及查询版本控制的权限，正式清理另需删除权限。权限应限定到授权目标。
 
 ## 3. 构建
@@ -292,8 +292,7 @@ Address = "127.0.0.1:3306"
 Database = "bsdb_sp0"
 
 [SpDB]
-User = "sp_purger"
-Passwd = "REPLACE_ME"
+# 只取 Address/Database 写入进度库绑定，用来区分 SP；工具不连接 SpDB
 Address = "127.0.0.1:3306"
 Database = "spdb_sp0"
 
@@ -311,7 +310,7 @@ IAMType = "AKSK"
 | 用途 | 环境变量 |
 |---|---|
 | BSDB 连接 | `BS_DB_USER`、`BS_DB_PASSWORD`、`BS_DB_ADDRESS`、`BS_DB_DATABASE` |
-| SpDB 连接 | `SP_DB_USER`、`SP_DB_PASSWORD`、`SP_DB_ADDRESS`、`SP_DB_DATABASE` |
+| SpDB 标识（仅绑定用） | `SP_DB_ADDRESS`、`SP_DB_DATABASE` |
 | 物理桶 URL | `BUCKET_URL` |
 | AKSK 凭证 | `AWS_ACCESS_KEY`、`AWS_SECRET_KEY`，可选 `AWS_SESSION_TOKEN` |
 | SA / IRSA 凭证 | 使用 AWS SDK 默认凭证链，例如 `AWS_ROLE_ARN`、`AWS_WEB_IDENTITY_TOKEN_FILE` |
@@ -351,7 +350,7 @@ IAMType = "AKSK"
 - verify 仅覆盖导入名单和当前配置物理桶，不代表链上已删除、停止计费或全部 SP 副本都消失。
 - 冻结目标数据是断点验收有效的前提；有回写可能时必须先停回写，再 --restart 完整复验。
 - 大小对账不是防误删证明，现有失败记录可能缺少角色/期望量，统计也可能因中断少计。
-- 使用官方 Greenfield 链客户端、AWS SDK；保留独立的受限批删及按 OID 清元数据，不直接调用 SP 完整 GC。
+- 使用官方 Greenfield 链客户端、AWS SDK；只做独立的受限批删，不改 SpDB，不直接调用 SP 完整 GC。SpDB 中保留的 `integrity_meta_NN` / `piece_hash` 会让 SP 认为对象仍有元数据，但 piece 已不存在，读取和挑战都会失败。
 
 单元测试覆盖容量分配、状态、会话锁互斥/失锁、piece 重试、安全停机、验收断点/代次及错误恢复。MySQL 真实生命周期测试为显式选用：
 

@@ -15,7 +15,6 @@ import (
 	"limewire-purge/internal/progress"
 	"limewire-purge/internal/s3store"
 	"limewire-purge/internal/spconfig"
-	"limewire-purge/internal/spdb"
 	verifier "limewire-purge/internal/verify"
 )
 
@@ -68,11 +67,6 @@ func runVerify(ctx context.Context, args []string) (retErr error) {
 	if err := store.EnsureVersioningDisabled(ctx, *allowVersioned); err != nil {
 		return err
 	}
-	meta, err := spdb.Open(cfg.SpDB.DSN())
-	if err != nil {
-		return err
-	}
-	defer meta.Close()
 	s, err = pg.BeginVerify(ctx, s, *restart)
 	if err != nil {
 		return err
@@ -81,7 +75,7 @@ func runVerify(ctx context.Context, args []string) (retErr error) {
 		*out = fmt.Sprintf("residue-task-%d.tsv", s.ID)
 	}
 	if !s.DoneAt.Valid {
-		r := verifier.Runner{Store: store, Meta: meta, Progress: pg, Task: s, Check: pg.CheckLock, QPS: *qps, MaxRetry: *retries, Timeout: *timeout}
+		r := verifier.Runner{Store: store, Progress: pg, Task: s, Check: pg.CheckLock, QPS: *qps, MaxRetry: *retries, Timeout: *timeout}
 		if err := r.Run(ctx); err != nil {
 			return err
 		}
